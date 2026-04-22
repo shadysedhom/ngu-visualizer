@@ -67,20 +67,12 @@ st.markdown("""
     [data-testid="collapsedControl"] svg,
     button[data-testid="stSidebarCollapseButton"] svg {
         fill: white !important;
-        color: white !important;
     }
 
     /* Sidebar Styling */
     section[data-testid="stSidebar"] {
         background-color: #000000 !important;
         border-right: 1px solid var(--border-subtle) !important;
-    }
-    section[data-testid="stSidebar"] p,
-    section[data-testid="stSidebar"] label,
-    section[data-testid="stSidebar"] h1,
-    section[data-testid="stSidebar"] h2,
-    section[data-testid="stSidebar"] h3 {
-        color: #ffffff !important;
     }
 
     /* Browse Files Button: Force black text for legibility */
