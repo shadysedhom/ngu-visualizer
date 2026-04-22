@@ -331,9 +331,13 @@ st.markdown("""
     .stFileUploader svg { fill: var(--accent-blue) !important; }
     /* Force white color for all text inside uploader zone */
     .stFileUploader section p, .stFileUploader section span, .stFileUploader small { 
-        color: white !important; 
+        color: var(--accent-blue) !important; 
     }
     [data-testid="stFileUploaderFileName"] { color: white !important; }
+
+    .stFileUploader button {
+        background-color: black !important;
+    }
 
     /* ---- SELECTS ---- */
     .stSelectbox label, .stMultiSelect label, .stRadio label {
