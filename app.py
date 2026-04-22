@@ -106,10 +106,6 @@ st.markdown("""
     }
     [data-testid="stFileUploaderFileName"] { color: white !important; }
 
-    .stFileUploader section {
-        color: "green" !important;
-    }
-
 
 
     h1, h2, h3 {
@@ -332,9 +328,6 @@ st.markdown("""
     }
 
     /* ---- FILE UPLOADER ---- */
-    [data-testid="stFileUploader"] * {
-        font-family: 'Space Grotesk', sans-serif !important;
-    }
     .stFileUploader section {
         background-color: var(--bg-surface) !important;
         border: 1px dashed var(--border-default) !important;
