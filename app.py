@@ -339,6 +339,9 @@ st.markdown("""
     }
 
     /* ---- FILE UPLOADER ---- */
+    [data-testid="stFileUploader"] * {
+        font-family: 'Space Grotesk', sans-serif !important;
+    }
     .stFileUploader section {
         background-color: var(--bg-surface) !important;
         border: 1px dashed var(--border-default) !important;
