@@ -81,7 +81,6 @@ st.markdown("""
     section[data-testid="stSidebar"] h2,
     section[data-testid="stSidebar"] h3 {
         color: #ffffff !important;
-        font-family: 'JetBrains Mono', monospace !important;
     }
 
     /* Browse Files Button: Force black text for legibility */
