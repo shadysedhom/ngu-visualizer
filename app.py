@@ -77,7 +77,6 @@ st.markdown("""
 
     /* Browse Files Button: Force black text for legibility */
     [data-testid="stFileUploader"] button {
-        color: #000000 !important;
         background-color: #ffffff !important;
         font-weight: 700 !important;
     }
