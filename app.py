@@ -103,13 +103,10 @@ st.markdown("""
         display: none !important;
     }
 
-    /* Force white color for all text inside uploader zone */
+    /* Force white color for all text inside uploader zone safely */
     .stFileUploader section p, 
-    .stFileUploader section span, 
-    .stFileUploader small,
-    [data-testid="stFileUploadDropzone"] div { 
+    .stFileUploader small { 
         color: white !important; 
-        font-family: 'JetBrains Mono', monospace !important; 
     }
     [data-testid="stFileUploaderFileName"] { color: white !important; }
 
@@ -121,6 +118,8 @@ st.markdown("""
     button[data-testid="stSidebarCollapseButton"] span {
         font-family: inherit !important;
     }
+
+    h1, h2, h3 {
         color: var(--text-primary) !important;
         font-family: 'JetBrains Mono', monospace !important;
         letter-spacing: -0.5px;
