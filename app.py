@@ -33,10 +33,6 @@ st.markdown("""
         --glow-blue: rgba(88, 166, 255, 0.08);
     }
 
-    html, body, [class*="css"] {
-        font-family: 'Space Grotesk', sans-serif;
-        color: white;
-    }
     code, pre { font-family: 'JetBrains Mono', monospace !important; }
 
     .main, .stApp { background-color: var(--bg-primary) !important; }
@@ -105,19 +101,17 @@ st.markdown("""
 
     /* Force white color for all text inside uploader zone safely */
     .stFileUploader section p, 
+    .stFileUploader section span, 
     .stFileUploader small { 
         color: white !important; 
     }
     [data-testid="stFileUploaderFileName"] { color: white !important; }
 
-    /* Fix: Ensure icons are NEVER hit by broad font overrides */
-    [data-testid="stIcon"], 
-    .material-icons, 
-    span[data-testid="stIcon"], 
-    [data-testid="collapsedControl"] span,
-    button[data-testid="stSidebarCollapseButton"] span {
-        font-family: inherit !important;
+    .stFileUploader section {
+        color: "green" !important;
     }
+
+
 
     h1, h2, h3 {
         color: var(--text-primary) !important;
@@ -355,7 +349,6 @@ st.markdown("""
     /* Force white color for all text inside uploader zone */
     .stFileUploader section p, .stFileUploader section span, .stFileUploader small { 
         color: white !important; 
-        font-family: 'JetBrains Mono', monospace !important; 
     }
     [data-testid="stFileUploaderFileName"] { color: white !important; }
 
