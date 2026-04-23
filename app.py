@@ -417,6 +417,11 @@ def process_log_file(uploaded_file):
         if not csv_string: return None, None, None, "No activitiesLog found."
         df_market = pd.read_csv(io.StringIO(csv_string), sep=';')
         df_market = df_market.sort_values(['product', 'timestamp']).reset_index(drop=True)
+        
+        # Fix Prosperity simulator bug where empty order books output a mid_price of 0.0
+        df_market['mid_price'] = df_market['mid_price'].replace(0.0, np.nan)
+        df_market['mid_price'] = df_market.groupby('product')['mid_price'].ffill()
+        
         df_market['profit_and_loss'] = df_market.groupby('product')['profit_and_loss'].ffill().fillna(0)
         
         for i in range(1, 4):
