@@ -689,428 +689,54 @@ def plot_whale_profiler(df_trd):
     )
     return fig
 
+def plot_tape_forensics_engine(df_mkt, df_trd):
 
-
-def plot_magic_size_fingerprinter(df_mkt, df_trd, markout_horizon):
-    if df_trd.empty: return go.Figure()
-    
-    # 1. Filter for NPC trades
-    npc_trades = df_trd[(~df_trd['is_our_buy']) & (~df_trd['is_our_sell'])].copy()
-    if npc_trades.empty: return go.Figure()
-    
-    # 2. Determine trade direction (heuristic based on L1 quotes)
-    # L1 quotes are already merged into df_trd in the main block
-    npc_trades['is_npc_buy'] = npc_trades['price'] >= npc_trades['ask_price_1']
-    npc_trades['is_npc_sell'] = npc_trades['price'] <= npc_trades['bid_price_1']
-    
-    # 3. Calculate Markout at T+horizon
-    df_mkt_future = df_mkt[['timestamp', 'mid_price']].copy()
-    df_mkt_future['timestamp'] = df_mkt_future['timestamp'] - (markout_horizon * 100)
-    df_mkt_future = df_mkt_future.rename(columns={'mid_price': 'future_mid'})
-    
-    m_trades = pd.merge(npc_trades, df_mkt_future, on='timestamp', how='inner')
-    if m_trades.empty: return go.Figure()
-    
-    m_trades['npc_edge'] = np.where(m_trades['is_npc_buy'], m_trades['future_mid'] - m_trades['price'], m_trades['price'] - m_trades['future_mid'])
-    
-    # Filter out trades where we couldn't determine direction clearly
-    m_trades = m_trades[m_trades['is_npc_buy'] | m_trades['is_npc_sell']]
+    # PARAMETERS
+    FUZZY_THRESHOLD = 20
 
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='Mid Price', line=dict(color="white", width=1), opacity=0.8))
     
-    # Trace for NPC Edge
-    fig.add_trace(go.Box(
-        x=m_trades['quantity'],
-        y=m_trades['npc_edge'],
-        marker_color=IMC_BLUE,
-        fillcolor='rgba(88, 166, 255, 0.4)',
-        line_color=IMC_BLUE,
-        boxpoints='outliers',
-        jitter=0.3,
-        pointpos=-1.8,
-        name="NPC Edge",
-        hoverinfo="y",
-        hovertemplate="Size: %{x}<br>NPC Edge: %{y:.2f}<extra></extra>"
-    ))
+    # --- 1. FUZZY ICEBERG DETECTION (Volume Density Approach) ---
+    mkt_trades = df_trd[~df_trd['is_our_buy'] & ~df_trd['is_our_sell']].copy()
+    if not mkt_trades.empty:
+        # Instead of fixed size_diff, look for volume density: 
+        # Group by price and rolling window. If Price X absorbs > X lots in 500ms, it's an iceberg.
+        mkt_trades['vol_density'] = mkt_trades.groupby('price')['quantity'].rolling(window=5, min_periods=3).sum().reset_index(0, drop=True)
+        icebergs = mkt_trades[mkt_trades['vol_density'] > FUZZY_THRESHOLD] # Fuzzy Threshold
+        
+        if not icebergs.empty:
+             fig.add_trace(go.Scatter(x=icebergs['timestamp'], y=icebergs['price'], mode='markers', name='Volume Cluster (Iceberg)', 
+                                    marker=dict(symbol='circle-open', size=12, color='#00FFFF', line=dict(width=2)),
+                                    hovertemplate="VOL CLUSTER<br>Price: %{y}<br>Density: %{customdata} lots<extra></extra>", 
+                                    customdata=icebergs['vol_density']))
+
+    # --- 2. ROBUST WALL DETECTION (Variance Approach) ---
+    # A wall is stable if the standard deviation of its price over 50 ticks is near zero
+    window = 50
+    df_mkt['bid_std'] = df_mkt['bid_price_3'].rolling(window=window).std()
+    df_mkt['ask_std'] = df_mkt['ask_price_3'].rolling(window=window).std()
     
+    # Identify walls that are stable (std < 0.1) and have significant depth
+    bid_walls = df_mkt[(df_mkt['bid_std'] < 0.1) & (df_mkt['bid_volume_3'] > 15)].copy()
+    ask_walls = df_mkt[(df_mkt['ask_std'] < 0.1) & (df_mkt['ask_volume_3'] > 15)].copy()
+    
+    # Vectorized plotting: instead of a for-loop, add one scatter trace of horizontal segments
+    if not bid_walls.empty:
+        fig.add_trace(go.Scatter(x=bid_walls['timestamp'], y=bid_walls['bid_price_3'], mode='markers', name='Static Bid Wall',
+                                 marker=dict(symbol='line-ew', size=10, color=PROFIT_GREEN, line=dict(width=2)), opacity=0.5))
+    if not ask_walls.empty:
+        fig.add_trace(go.Scatter(x=ask_walls['timestamp'], y=ask_walls['ask_price_3'], mode='markers', name='Static Ask Wall',
+                                 marker=dict(symbol='line-ew', size=10, color=LOSS_RED, line=dict(width=2)), opacity=0.5))
+        
     fig.update_layout(
-        title=dict(text=f"MAGIC SIZE FINGERPRINTER (NPC EDGE T+{markout_horizon*100})", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        title=dict(text="TAPE FORENSICS ENGINE — FUZZY SIGNATURE HUNTING", font=dict(color="#ffffff", size=14, family="JetBrains Mono"), x=0),
         plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
         font=dict(color="#ffffff", family="JetBrains Mono"),
-        yaxis=dict(title=dict(text="NPC Markout Edge (Ticks)", font=dict(color="#ffffff")), zeroline=True, zerolinewidth=1, zerolinecolor=GRID_COLOR, showgrid=True, gridcolor=GRID_COLOR, tickfont=dict(size=9, color="#ffffff")),
-        xaxis=dict(title=dict(text="Trade Size (Lots)", font=dict(color="#ffffff")), type='category', tickfont=dict(size=9, color="#ffffff"), categoryorder='category ascending'),
-        showlegend=False,
-        margin=dict(l=0, r=40, t=40, b=0)
-    )
-    return fig
-
-def plot_liquidation_radar(df_mkt, df_trd):
-    if df_trd.empty: return go.Figure()
-    
-    npc_trades = df_trd[(~df_trd['is_our_buy']) & (~df_trd['is_our_sell'])].copy()
-    if npc_trades.empty: return go.Figure()
-    
-    # L1 quotes are already merged into df_trd in the main block
-    npc_trades['is_npc_buy'] = npc_trades['price'] >= npc_trades['ask_price_1']
-    npc_trades['is_npc_sell'] = npc_trades['price'] <= npc_trades['bid_price_1']
-    
-    npc_trades['signed_vol'] = 0
-    npc_trades.loc[npc_trades['is_npc_buy'], 'signed_vol'] = npc_trades['quantity']
-    npc_trades.loc[npc_trades['is_npc_sell'], 'signed_vol'] = -npc_trades['quantity']
-    
-    # Map back to market timestamps to keep alignment with price
-    # We calculate the sum of signed volume for each market tick, then cumulative sum
-    npc_trades['tick'] = (np.ceil(npc_trades['timestamp'] / 100.0) * 100).astype(int)
-    flow_grouped = npc_trades.groupby('tick')['signed_vol'].sum()
-    
-    df_mkt_flow = df_mkt.set_index('timestamp').copy()
-    df_mkt_flow['net_flow_cum'] = flow_grouped.reindex(df_mkt_flow.index).fillna(0).cumsum()
-    df_mkt_flow = df_mkt_flow.reset_index()
-
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    fig.add_trace(go.Scatter(x=df_mkt_flow['timestamp'], y=df_mkt_flow['mid_price'], name="Mid Price", line=dict(color='#f0f4f8', width=2), opacity=0.6, hoverinfo='skip'), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_mkt_flow['timestamp'], y=df_mkt_flow['net_flow_cum'], name="Cumulative NPC Flow", fill='tozeroy', line=dict(color=IMC_BLUE, width=1), fillcolor='rgba(88, 166, 255, 0.15)', hoverinfo='skip'), secondary_y=True)
-    
-    fig.add_trace(go.Scatter(x=df_mkt_flow['timestamp'], y=df_mkt_flow['mid_price'], name="Metrics", mode='lines', line=dict(color='rgba(0,0,0,0)'), customdata=df_mkt_flow['net_flow_cum'], hovertemplate="Mid Price: %{y:,.1f}<br>Net Flow: %{customdata} lots<extra></extra>", showlegend=False), secondary_y=False)
-
-    fig.update_layout(
-        title=dict(text="LIQUIDATION RADAR (CUMULATIVE NPC FLOW)", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff"), linecolor=GRID_COLOR),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Mid Price", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Net NPC Flow (Lots)", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x",
-    )
-    return fig
-
-def plot_true_mid_divergence(df_mkt):
-    if df_mkt.empty: return go.Figure()
-    
-    df = df_mkt.copy()
-    
-    # Calculate True Mid based on L3 (The Wall) with graceful degradation
-    
-    # BIDS
-    l2_bid = df['bid_price_2'].fillna(df['bid_price_1'])
-    l3_bid = df['bid_price_3'].fillna(l2_bid)
-    
-    # ASKS
-    l2_ask = df['ask_price_2'].fillna(df['ask_price_1'])
-    l3_ask = df['ask_price_3'].fillna(l2_ask)
-    
-    df['wall_mid'] = (l3_bid + l3_ask) / 2.0
-    
-    fig = go.Figure()
-    
-    # Fake Mid (Noisy, Pennying)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], mode='lines', name='L1 Mid (Fade)', line=dict(color='#556677', width=1, dash='dot'), opacity=0.8, hovertemplate="Fake Mid: %{y:.1f}<extra></extra>"))
-    
-    # True Mid (Wall Mid, Structural)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['wall_mid'], mode='lines', name='L3 Wall Mid (True)', line=dict(color=IMC_BLUE, width=2), hovertemplate="True Mid: %{y:.1f}<extra></extra>"))
-    
-    # Shade the divergence (when L1 Mid disconnects from Wall Mid)
-    df['divergence'] = df['mid_price'] - df['wall_mid']
-    
-    fig.update_layout(
-        title=dict(text=f"L3 WALL MID vs. L1 MID DIVERGENCE", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Price", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
-    )
-    return fig
-
-def plot_vwap_momentum(df_mkt, df_trd, rolling_window=10):
-    if df_trd.empty: return go.Figure()
-    
-    # Calculate VWAP of ALL market trades per tick
-    df_t = df_trd.copy()
-    df_t['tick'] = (np.ceil(df_t['timestamp'] / 100.0) * 100).astype(int)
-    df_t['notional'] = df_t['price'] * df_t['quantity']
-    
-    # Aggregate volume and notional per tick
-    tick_agg = df_t.groupby('tick').agg({'quantity': 'sum', 'notional': 'sum'}).reset_index()
-    tick_agg['tick_vwap'] = tick_agg['notional'] / tick_agg['quantity']
-    
-    # Merge with Market Data
-    df = df_mkt[['timestamp', 'mid_price']].copy()
-    df = pd.merge(df, tick_agg, left_on='timestamp', right_on='tick', how='left')
-    
-    # Calculate Rolling VWAP
-    # We use a rolling sum of notional and volume to properly weight the VWAP over time
-    df['roll_vol'] = df['quantity'].fillna(0).rolling(window=rolling_window, min_periods=1).sum()
-    df['roll_notional'] = df['notional'].fillna(0).rolling(window=rolling_window, min_periods=1).sum()
-    
-    # Only calculate VWAP where there is volume, otherwise fallback to 0 difference
-    df['rolling_vwap'] = np.where(df['roll_vol'] > 0, df['roll_notional'] / df['roll_vol'], df['mid_price'])
-    
-    # The Oscillator: Rolling VWAP - Resting Mid Price
-    df['vwap_momentum'] = df['rolling_vwap'] - df['mid_price']
-    
-    fig = go.Figure()
-    
-    # The Zero Line (Resting L1 Mid)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=[0]*len(df), mode='lines', name='Resting Mid Baseline', line=dict(color='#556677', width=1), hoverinfo='skip'))
-    
-    # The Histogram (Momentum)
-    colors = np.where(df['vwap_momentum'] >= 0, PROFIT_GREEN, LOSS_RED)
-    
-    fig.add_trace(go.Bar(
-        x=df['timestamp'],
-        y=df['vwap_momentum'],
-        marker_color=colors,
-        name='VWAP Momentum',
-        opacity=0.8,
-        hovertemplate="Momentum: %{y:.2f} ticks<extra></extra>"
-    ))
-    
-    fig.update_layout(
-        title=dict(text=f"VWAP MOMENTUM CROSSOVER ({rolling_window}-TICK ROLL)", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(title=dict(text="VWAP vs Mid (Ticks)", font=dict(color="#ffffff")), zeroline=True, zerolinewidth=1, zerolinecolor=GRID_COLOR, showgrid=True, gridcolor=GRID_COLOR, tickfont=dict(size=9, color="#ffffff")),
-        showlegend=False,
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
-    )
-    return fig
-
-def plot_telemetry_brainwaves(df_mkt, df_trd, df_tel, selected_signals):
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    if df_mkt.empty: return fig
-    
-    # 1. Baseline: Market Mid Price
-    fig.add_trace(
-        go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='L1 Mid Price', line=dict(color='#f0f4f8', width=2), opacity=0.7),
-        secondary_y=False
-    )
-    
-    # 2. Executions (To see EXACTLY when the bot acted based on the signals)
-    if not df_trd.empty:
-        our_buys = df_trd[df_trd['is_our_buy']]
-        our_sells = df_trd[df_trd['is_our_sell']]
-        
-        if not our_buys.empty:
-            fig.add_trace(go.Scatter(
-                x=our_buys['timestamp'], y=our_buys['price'], mode='markers', name='Our Buys',
-                marker=dict(symbol='triangle-up', size=10, color=PROFIT_GREEN, line=dict(width=1, color='white')),
-                hovertemplate="BOUGHT %{text} @ %{y}<extra></extra>", text=our_buys['quantity']
-            ), secondary_y=False)
-            
-        if not our_sells.empty:
-            fig.add_trace(go.Scatter(
-                x=our_sells['timestamp'], y=our_sells['price'], mode='markers', name='Our Sells',
-                marker=dict(symbol='triangle-down', size=10, color=LOSS_RED, line=dict(width=1, color='white')),
-                hovertemplate="SOLD %{text} @ %{y}<extra></extra>", text=our_sells['quantity']
-            ), secondary_y=False)
-
-    # 3. The Brainwaves (Telemetry Signals)
-    if not df_tel.empty and selected_signals:
-        # Get typical market price to determine if a signal needs a secondary axis
-        avg_price = df_mkt['mid_price'].mean() if not df_mkt['mid_price'].isna().all() else 10000
-        
-        color_palette = [IMC_BLUE, '#a855f7', '#06d6a0', '#f59e0b', '#ff6b6b', '#4ecdc4', '#ffe66d']
-        
-        for i, sig in enumerate(selected_signals):
-            if sig not in df_tel.columns: continue
-            
-            sig_data = df_tel[['timestamp', sig]].dropna()
-            if sig_data.empty: continue
-            
-            # Determine Axis
-            # If the signal's mean magnitude is tiny compared to the price (e.g., a Z-Score of 2.5 vs a price of 10000), 
-            # or if it's negative, put it on the secondary Y-axis.
-            sig_mean_abs = sig_data[sig].abs().mean()
-            use_secondary = False
-            
-            if sig_mean_abs < (avg_price * 0.1) or sig_data[sig].min() < 0:
-                use_secondary = True
-                
-            line_color = color_palette[i % len(color_palette)]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=sig_data['timestamp'], y=sig_data[sig], 
-                    mode='lines', name=sig.upper(), 
-                    line=dict(color=line_color, width=1.5, dash='solid' if not use_secondary else 'dot'),
-                    hovertemplate=f"{sig.upper()}: %{{y:.3f}}<extra></extra>"
-                ),
-                secondary_y=use_secondary
-            )
-
-    fig.update_layout(
-        title=dict(text="LOG YOUR INTERNAL VARS SO YOU CAN SEE HOW YOUR ALGO OPERATES<br><span style='font-size:9px; color:#8899aa; font-weight:400;'>REQUIRED FORMAT: [TAG] | PROD: ASSET_NAME | MY_ALPHA: 123.45 | Z_SCORE: 2.1</span>", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Price / Fair Value", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Oscillators / Z-Scores", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
-    )
-    return fig
-
-def plot_telemetry_brainwaves(df_mkt, df_trd, df_tel, selected_signals):
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    if df_mkt.empty: return fig
-    
-    # 1. Baseline: Market Mid Price
-    fig.add_trace(
-        go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='L1 Mid Price', line=dict(color='#f0f4f8', width=2), opacity=0.7),
-        secondary_y=False
-    )
-    
-    # 2. Executions (To see EXACTLY when the bot acted based on the signals)
-    if not df_trd.empty:
-        our_buys = df_trd[df_trd['is_our_buy']]
-        our_sells = df_trd[df_trd['is_our_sell']]
-        
-        if not our_buys.empty:
-            fig.add_trace(go.Scatter(
-                x=our_buys['timestamp'], y=our_buys['price'], mode='markers', name='Our Buys',
-                marker=dict(symbol='triangle-up', size=10, color=PROFIT_GREEN, line=dict(width=1, color='white')),
-                hovertemplate="BOUGHT %{text} @ %{y}<extra></extra>", text=our_buys['quantity']
-            ), secondary_y=False)
-            
-        if not our_sells.empty:
-            fig.add_trace(go.Scatter(
-                x=our_sells['timestamp'], y=our_sells['price'], mode='markers', name='Our Sells',
-                marker=dict(symbol='triangle-down', size=10, color=LOSS_RED, line=dict(width=1, color='white')),
-                hovertemplate="SOLD %{text} @ %{y}<extra></extra>", text=our_sells['quantity']
-            ), secondary_y=False)
-
-    # 3. The Brainwaves (Telemetry Signals)
-    if not df_tel.empty and selected_signals:
-        # Get typical market price to determine if a signal needs a secondary axis
-        avg_price = df_mkt['mid_price'].mean() if not df_mkt['mid_price'].isna().all() else 10000
-        
-        color_palette = [IMC_BLUE, '#a855f7', '#06d6a0', '#f59e0b', '#ff6b6b', '#4ecdc4', '#ffe66d']
-        
-        for i, sig in enumerate(selected_signals):
-            if sig not in df_tel.columns: continue
-            
-            sig_data = df_tel[['timestamp', sig]].dropna()
-            if sig_data.empty: continue
-            
-            # Determine Axis
-            # If the signal's mean magnitude is tiny compared to the price (e.g., a Z-Score of 2.5 vs a price of 10000), 
-            # or if it's negative, put it on the secondary Y-axis.
-            sig_mean_abs = sig_data[sig].abs().mean()
-            use_secondary = False
-            
-            if sig_mean_abs < (avg_price * 0.1) or sig_data[sig].min() < 0:
-                use_secondary = True
-                
-            line_color = color_palette[i % len(color_palette)]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=sig_data['timestamp'], y=sig_data[sig], 
-                    mode='lines', name=sig.upper(), 
-                    line=dict(color=line_color, width=1.5, dash='solid' if not use_secondary else 'dot'),
-                    hovertemplate=f"{sig.upper()}: %{{y:.3f}}<extra></extra>"
-                ),
-                secondary_y=use_secondary
-            )
-
-    fig.update_layout(
-        title=dict(text="LOG YOUR INTERNAL VARS SO YOU CAN SEE HOW YOUR ALGO OPERATES<br><span style='font-size:9px; color:#8899aa; font-weight:400;'>REQUIRED FORMAT: [TAG] | PROD: ASSET_NAME | MY_ALPHA: 123.45 | Z_SCORE: 2.1</span>", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Price / Fair Value", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Oscillators / Z-Scores", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
-    )
-    return fig
-
-def plot_telemetry_brainwaves(df_mkt, df_trd, df_tel, selected_signals):
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    if df_mkt.empty: return fig
-    
-    # 1. Baseline: Market Mid Price
-    fig.add_trace(
-        go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='L1 Mid Price', line=dict(color='#f0f4f8', width=2), opacity=0.7),
-        secondary_y=False
-    )
-    
-    # 2. Executions (To see EXACTLY when the bot acted based on the signals)
-    if not df_trd.empty:
-        our_buys = df_trd[df_trd['is_our_buy']]
-        our_sells = df_trd[df_trd['is_our_sell']]
-        
-        if not our_buys.empty:
-            fig.add_trace(go.Scatter(
-                x=our_buys['timestamp'], y=our_buys['price'], mode='markers', name='Our Buys',
-                marker=dict(symbol='triangle-up', size=10, color=PROFIT_GREEN, line=dict(width=1, color='white')),
-                hovertemplate="BOUGHT %{text} @ %{y}<extra></extra>", text=our_buys['quantity']
-            ), secondary_y=False)
-            
-        if not our_sells.empty:
-            fig.add_trace(go.Scatter(
-                x=our_sells['timestamp'], y=our_sells['price'], mode='markers', name='Our Sells',
-                marker=dict(symbol='triangle-down', size=10, color=LOSS_RED, line=dict(width=1, color='white')),
-                hovertemplate="SOLD %{text} @ %{y}<extra></extra>", text=our_sells['quantity']
-            ), secondary_y=False)
-
-    # 3. The Brainwaves (Telemetry Signals)
-    if not df_tel.empty and selected_signals:
-        # Get typical market price to determine if a signal needs a secondary axis
-        avg_price = df_mkt['mid_price'].mean() if not df_mkt['mid_price'].isna().all() else 10000
-        
-        color_palette = [IMC_BLUE, '#a855f7', '#06d6a0', '#f59e0b', '#ff6b6b', '#4ecdc4', '#ffe66d']
-        
-        for i, sig in enumerate(selected_signals):
-            if sig not in df_tel.columns: continue
-            
-            sig_data = df_tel[['timestamp', sig]].dropna()
-            if sig_data.empty: continue
-            
-            # Determine Axis
-            # If the signal's mean magnitude is tiny compared to the price (e.g., a Z-Score of 2.5 vs a price of 10000), 
-            # or if it's negative, put it on the secondary Y-axis.
-            sig_mean_abs = sig_data[sig].abs().mean()
-            use_secondary = False
-            
-            if sig_mean_abs < (avg_price * 0.1) or sig_data[sig].min() < 0:
-                use_secondary = True
-                
-            line_color = color_palette[i % len(color_palette)]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=sig_data['timestamp'], y=sig_data[sig], 
-                    mode='lines', name=sig.upper(), 
-                    line=dict(color=line_color, width=1.5, dash='solid' if not use_secondary else 'dot'),
-                    hovertemplate=f"{sig.upper()}: %{{y:.3f}}<extra></extra>"
-                ),
-                secondary_y=use_secondary
-            )
-
-    fig.update_layout(
-        title=dict(text="LOG YOUR INTERNAL VARS SO YOU CAN SEE HOW YOUR ALGO OPERATES<br><span style='font-size:9px; color:#8899aa; font-weight:400;'>REQUIRED FORMAT: [TAG] | PROD: ASSET_NAME | MY_ALPHA: 123.45 | Z_SCORE: 2.1</span>", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Price / Fair Value", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Oscillators / Z-Scores", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
+        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="Timestamp"),
+        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="Price Level"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=9)),
+        margin=dict(l=0, r=40, t=60, b=0)
     )
     return fig
 
@@ -1183,19 +809,6 @@ imbalance_level = st.sidebar.radio(
     help="Which level of book depth to use for the Imbalance Matrix."
 )
 
-st.sidebar.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
-st.sidebar.markdown("""
-    <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700;
-        color: var(--text-tertiary); letter-spacing: 3px; text-transform: uppercase; margin-bottom: 12px;">
-        MOMENTUM TUNING
-    </div>
-""", unsafe_allow_html=True)
-
-vwap_window = st.sidebar.slider(
-    "VWAP ROLL WINDOW (TICKS)", min_value=1, max_value=50, value=5, step=1,
-    help="Number of ticks to include in the rolling VWAP calculation for the momentum oscillator."
-)
-
 
 if selected_product:
     df_mkt_prod = df_market[df_market['product'] == selected_product].copy()
@@ -1218,7 +831,6 @@ if selected_product:
     max_drawdown = abs((pnl_series - pnl_series.cummax()).min())
     
     # Granular Profit Factor
-    maker_pnl, taker_pnl = 0.0, 0.0
     if not df_trd_prod.empty:
         our_trades = df_trd_prod[df_trd_prod['is_our_buy'] | df_trd_prod['is_our_sell']].copy()
         if not our_trades.empty:
@@ -1226,8 +838,6 @@ if selected_product:
             our_trades['trade_pnl'] = np.where(our_trades['is_our_buy'], 
                                                (last_mid - our_trades['price']) * our_trades['quantity'],
                                                (our_trades['price'] - last_mid) * our_trades['quantity'])
-            maker_pnl = our_trades[~our_trades['is_taker']]['trade_pnl'].sum()
-            taker_pnl = our_trades[our_trades['is_taker']]['trade_pnl'].sum()
             gross_p = our_trades[our_trades['trade_pnl'] > 0]['trade_pnl'].sum()
             gross_l = abs(our_trades[our_trades['trade_pnl'] < 0]['trade_pnl'].sum())
             profit_factor = (gross_p / gross_l) if gross_l > 0 else (2.0 if gross_p > 0 else 0.0)
@@ -1285,13 +895,9 @@ if selected_product:
         pnl_color = "pos" if final_pnl >= 0 else "neg"
         ppl_color = "pos" if pnl_per_lot >= 0 else "neg"
         
-        m_color = "#3FB950" if maker_pnl >= 0 else "#F85149"
-        t_color = "#3FB950" if taker_pnl >= 0 else "#F85149"
-        pnl_subtext = f"M: <span style='color:{m_color}; font-weight:600;'>{maker_pnl:,.0f}</span> | T: <span style='color:{t_color}; font-weight:600;'>{taker_pnl:,.0f}</span>"
-        
         st.markdown(f"""
             <div class="metric-grid-5">
-                {metric_card("FINAL PNL", f"{final_pnl:,.0f} $", pnl_subtext, pnl_color, "cyan")}
+                {metric_card("FINAL PNL", f"{final_pnl:,.0f} $", f"Xirecs", pnl_color, "cyan")}
                 {metric_card("VOLUME TRADED", f"{total_vol:,.0f}", "Lots", "", "")}
                 {metric_card("PNL PER LOT", f"{pnl_per_lot:,.2f}", "Xirecs / Lot", ppl_color, "purple")}
                 {metric_card("% MAKER FILLS", f"{maker_pct:.1f}%", "of total volume", "", "")}
@@ -1333,63 +939,22 @@ if selected_product:
     """, unsafe_allow_html=True)
 
     # ---- MACRO CHARTS ----
-    st.plotly_chart(plot_pnl_inventory(df_mkt_prod, selected_product), width='stretch')
-    st.plotly_chart(plot_microstructure_xray(df_mkt_prod, df_trd_prod), width='stretch')
-    
-    st.markdown("---")
-    st.markdown('<div class="section-label">🤖&nbsp;&nbsp;BOT BEHAVIOR & FLOW DYNAMICS</div>', unsafe_allow_html=True)
-    
-    c5, c6 = st.columns(2)
-    with c5: st.plotly_chart(plot_magic_size_fingerprinter(df_mkt_prod, df_trd_prod, markout_horizon), width='stretch')
-    with c6: st.plotly_chart(plot_liquidation_radar(df_mkt_prod, df_trd_prod), width='stretch')
-    
-    st.markdown("---")
-    st.markdown('<div class="section-label">🎯&nbsp;&nbsp;MOMENTUM & WALL ANALYTICS</div>', unsafe_allow_html=True)
-    
-    st.plotly_chart(plot_true_mid_divergence(df_mkt_prod), width='stretch')
-    st.plotly_chart(plot_vwap_momentum(df_mkt_prod, df_trd_prod, vwap_window), width='stretch')
+    st.plotly_chart(plot_pnl_inventory(df_mkt_prod, selected_product), use_container_width=True)
+    st.plotly_chart(plot_microstructure_xray(df_mkt_prod, df_trd_prod), use_container_width=True)
     
     st.markdown("---")
     st.markdown('<div class="section-label">🔬&nbsp;&nbsp;EXECUTION & FLOW ANALYSIS</div>', unsafe_allow_html=True)
     
     c1, c2 = st.columns(2)
-    with c1: st.plotly_chart(plot_toxicity_markout(m_trades, markout_horizon), width='stretch')
-    with c2: st.plotly_chart(plot_spread_capture(m_trades, df_mkt_prod), width='stretch')
+    with c1: st.plotly_chart(plot_toxicity_markout(m_trades, markout_horizon), use_container_width=True)
+    with c2: st.plotly_chart(plot_spread_capture(m_trades, df_mkt_prod), use_container_width=True)
 
     c3, c4 = st.columns(2)
-    with c3: st.plotly_chart(plot_imbalance_matrix(m_trades, df_mkt_prod, imbalance_level), width='stretch')
-    with c4: st.plotly_chart(plot_whale_profiler(df_trd_prod), width='stretch')
+    with c3: st.plotly_chart(plot_imbalance_matrix(m_trades, df_mkt_prod, imbalance_level), use_container_width=True)
+    with c4: st.plotly_chart(plot_whale_profiler(df_trd_prod), use_container_width=True)
 
     st.markdown("---")
-    st.markdown('<div class="section-label">🧠&nbsp;&nbsp;TELEMETRY & SIGNAL DIAGNOSTICS</div>', unsafe_allow_html=True)
-    
-    # Filter telemetry for current product
-    df_tel_prod = df_telemetry[df_telemetry['target_product'] == selected_product].copy() if not df_telemetry.empty else pd.DataFrame()
-    
-    available_signals = []
-    if not df_tel_prod.empty:
-        for col in df_tel_prod.columns:
-            if col not in ['timestamp', 'tag', 'target_product']:
-                # safely convert to numeric, dropping non-numerics
-                df_tel_prod[col] = pd.to_numeric(df_tel_prod[col], errors='coerce')
-                if not df_tel_prod[col].isna().all():
-                    available_signals.append(col)
-                    
-    # Create empty container for plot to render ABOVE the controls
-    telemetry_plot_container = st.container()
-    
-    # Create the multi-select visually BELOW the plot
-    st.markdown("<br>", unsafe_allow_html=True)
-    selected_signals = st.multiselect(
-        "SELECT TELEMETRY SIGNALS TO OVERLAY", 
-        options=available_signals,
-        default=[],
-        help="Select any logged numerical value to overlay on the price chart."
-    )
-    
-    # Render plot into the container
-    with telemetry_plot_container:
-        st.plotly_chart(plot_telemetry_brainwaves(df_mkt_prod, df_trd_prod, df_tel_prod, selected_signals), width='stretch')
+    st.plotly_chart(plot_tape_forensics_engine(df_mkt_prod, df_trd_prod), use_container_width=True)
 
 else:
     st.markdown("""
