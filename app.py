@@ -535,6 +535,19 @@ def plot_microstructure_xray(df_mkt, df_trd):
     l3_bid, l3_ask = df_mkt['bid_price_3'].fillna(l2_bid), df_mkt['ask_price_3'].fillna(l2_ask)
     df_mkt['l3_mid'] = (l3_bid + l3_ask) / 2.0
 
+    # --- RAW BID/ASK LINES (Hidden by default, grouped by Level) ---
+    # Level 1
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['bid_price_1'], mode='lines', name='L1 Bid', line=dict(color='rgba(63, 185, 80, 0.8)', width=1), visible='legendonly', legendgroup='L1', legendgrouptitle_text='L1 BA'))
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['ask_price_1'], mode='lines', name='L1 Ask', line=dict(color='rgba(248, 81, 73, 0.8)', width=1), visible='legendonly', legendgroup='L1'))
+    
+    # Level 2
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['bid_price_2'], mode='lines', name='L2 Bid', line=dict(color='rgba(63, 185, 80, 0.5)', width=1, dash='dash'), visible='legendonly', legendgroup='L2', legendgrouptitle_text='L2 BA'))
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['ask_price_2'], mode='lines', name='L2 Ask', line=dict(color='rgba(248, 81, 73, 0.5)', width=1, dash='dash'), visible='legendonly', legendgroup='L2'))
+    
+    # Level 3
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['bid_price_3'], mode='lines', name='L3 Bid', line=dict(color='rgba(63, 185, 80, 0.3)', width=1, dash='dot'), visible='legendonly', legendgroup='L3', legendgrouptitle_text='L3 BA'))
+    fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['ask_price_3'], mode='lines', name='L3 Ask', line=dict(color='rgba(248, 81, 73, 0.3)', width=1, dash='dot'), visible='legendonly', legendgroup='L3'))
+
     fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='L1 Mid', line=dict(color='#f0f4f8', width=2), opacity=0.9))
     fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['l2_mid'], mode='lines', name='L2 Mid', line=dict(color='#556677', width=1, dash='dash'), opacity=0.6))
     fig.add_trace(go.Scatter(x=df_mkt['timestamp'], y=df_mkt['l3_mid'], mode='lines', name='L3 Mid (Wall)', line=dict(color=IMC_BLUE, width=1, dash='dot'), opacity=0.6))
