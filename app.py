@@ -650,7 +650,7 @@ def plot_spread_capture(our_trades, df_mkt):
         ))
     
     fig.update_layout(
-        title=dict(text="PANEL 2 — REALIZED vs. QUOTED SPREAD", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        title=dict(text="PANEL 2 — QUOTED vs. REALIZED SPREAD EDGE", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
         plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
         font=dict(color="#ffffff", family="JetBrains Mono"),
         yaxis=dict(title=dict(text="Edge (Ticks)", font=dict(color="#ffffff")), zeroline=True, zerolinewidth=1, zerolinecolor=GRID_COLOR, showgrid=True, gridcolor=GRID_COLOR, tickfont=dict(size=9, color="#ffffff")),
