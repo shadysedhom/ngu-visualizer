@@ -403,11 +403,38 @@ PANEL_BG = '#0c1017'
 GRID_COLOR = '#1a2030'
 TEXT_COLOR = '#8899aa'
 
-LIMITS = {'ASH_COATED_OSMIUM': 80, 'INTARIAN_PEPPER_ROOT': 80}
+LIMITS = {
+    'ASH_COATED_OSMIUM': 80,
+    'INTARIAN_PEPPER_ROOT': 80,
+    'HYDROGEL_PACK': 200,
+    'VELVETFRUIT_EXTRACT': 200,
+    'VEV_4000': 300,
+    'VEV_4500': 300,
+    'VEV_5000': 300,
+    'VEV_5100': 300,
+    'VEV_5200': 300,
+    'VEV_5300': 300,
+    'VEV_5400': 300,
+    'VEV_5500': 300,
+    'VEV_6000': 300,
+    'VEV_6500': 300,
+}
 
 PRODUCT_ALIASES = {
     'ASH_COATED_OSMIUM': ['OSM', 'ASH', 'OSMIUM'],
-    'INTARIAN_PEPPER_ROOT': ['PEP', 'INT', 'PEPPER', 'ROOT']
+    'INTARIAN_PEPPER_ROOT': ['PEP', 'INT', 'PEPPER', 'ROOT'],
+    'HYDROGEL_PACK': ['HYDROGEL', 'HYP'],
+    'VELVETFRUIT_EXTRACT': ['VELVET', 'VELVETFRUIT', 'VFE'],
+    'VEV_4000': ['VEV4000'],
+    'VEV_4500': ['VEV4500'],
+    'VEV_5000': ['VEV5000'],
+    'VEV_5100': ['VEV5100'],
+    'VEV_5200': ['VEV5200'],
+    'VEV_5300': ['VEV5300'],
+    'VEV_5400': ['VEV5400'],
+    'VEV_5500': ['VEV5500'],
+    'VEV_6000': ['VEV6000'],
+    'VEV_6500': ['VEV6500'],
 }
 
 def extract_lambda_text_and_positions(lambda_log):
