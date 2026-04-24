@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import json
 import io
+import re
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -404,6 +405,88 @@ TEXT_COLOR = '#8899aa'
 
 LIMITS = {'ASH_COATED_OSMIUM': 80, 'INTARIAN_PEPPER_ROOT': 80}
 
+PRODUCT_ALIASES = {
+    'ASH_COATED_OSMIUM': ['OSM', 'ASH', 'OSMIUM'],
+    'INTARIAN_PEPPER_ROOT': ['PEP', 'INT', 'PEPPER', 'ROOT']
+}
+
+def extract_lambda_text_and_positions(lambda_log):
+    """Prosperity lambdaLog is usually a JSON wrapper; return only flushed text logs."""
+    if not lambda_log:
+        return "", {}
+
+    try:
+        payload = json.loads(lambda_log)
+    except (TypeError, json.JSONDecodeError):
+        return str(lambda_log), {}
+
+    if not isinstance(payload, list):
+        return str(lambda_log), {}
+
+    state_positions = {}
+    if payload and isinstance(payload[0], list) and len(payload[0]) > 6 and isinstance(payload[0][6], dict):
+        state_positions = payload[0][6]
+
+    for item in reversed(payload):
+        if isinstance(item, str) and ('|' in item or '\n' in item):
+            return item, state_positions
+
+    return "", state_positions
+
+def infer_product_from_telemetry_line(line):
+    line_upper = line.upper()
+    for product, aliases in PRODUCT_ALIASES.items():
+        if product in line_upper or any(alias in line_upper for alias in aliases):
+            return product
+    return "UNKNOWN"
+
+def clean_telemetry_key(raw_key, product):
+    key = raw_key.strip()
+    aliases = PRODUCT_ALIASES.get(product, [])
+    for alias in aliases + [product]:
+        if key.upper().startswith(alias):
+            key = key[len(alias):].strip()
+            break
+    key = key.strip(" -_:")
+    return key.lower().replace(" ", "_")
+
+def parse_telemetry_line(line):
+    if '|' not in line:
+        return None
+
+    parts = [p.strip() for p in line.split('|') if p.strip()]
+    if not parts:
+        return None
+
+    explicit_product = None
+    for part in parts:
+        if ':' not in part:
+            continue
+        raw_key, raw_value = part.split(':', 1)
+        key = raw_key.strip().lower().replace(" ", "_")
+        if key in {'prod', 'product', 'symbol', 'asset'}:
+            explicit_product = raw_value.strip()
+            break
+
+    target_product = explicit_product or infer_product_from_telemetry_line(line)
+    tag = parts[0].split(':', 1)[0].strip()
+    row = {'tag': tag, 'target_product': target_product}
+
+    for part in parts:
+        if ':' not in part:
+            continue
+        raw_key, raw_value = part.split(':', 1)
+        key = clean_telemetry_key(raw_key, target_product)
+        if not key:
+            continue
+        value = raw_value.strip()
+        try:
+            row[key] = float(value)
+        except ValueError:
+            row[key] = value
+
+    return row
+
 # --- DATA PROCESSING (UNCHANGED) ---
 @st.cache_data
 def process_log_file(uploaded_file):
@@ -423,6 +506,16 @@ def process_log_file(uploaded_file):
         df_market['mid_price'] = df_market.groupby('product')['mid_price'].ffill()
         
         df_market['profit_and_loss'] = df_market.groupby('product')['profit_and_loss'].ffill().fillna(0)
+        raw_logs = data.get('logs', [])
+        sandbox_logs = [str(entry.get('sandboxLog', '')).strip() for entry in raw_logs if str(entry.get('sandboxLog', '')).strip()]
+        df_market.attrs['sandbox_message_count'] = len(sandbox_logs)
+        final_profit_matches = [
+            float(match.group(1))
+            for log in sandbox_logs
+            for match in re.finditer(r"final profit of ([+-]?\d+(?:\.\d+)?)", log)
+        ]
+        if final_profit_matches:
+            df_market.attrs['adjusted_final_profit'] = final_profit_matches[-1]
         
         for i in range(1, 4):
             b_cols = [f'bid_volume_{j}' for j in range(1, i + 1)]
@@ -442,41 +535,18 @@ def process_log_file(uploaded_file):
             df_trades['is_our_sell'] = df_trades['seller'] == 'SUBMISSION'
 
         telemetry_rows = []
-        raw_logs = data.get('logs', [])
-        product_map = {
-            'ASH_COATED_OSMIUM': ['OSM', 'ASH', 'OSMIUM'],
-            'INTARIAN_PEPPER_ROOT': ['PEP', 'INT', 'PEPPER', 'ROOT']
-        }
-
         for entry in raw_logs:
             t = entry.get('timestamp', 0)
-            ll = entry.get('lambdaLog', '')
-            if not ll: continue
-            
-            for line in ll.split('\n'):
-                if '|' not in line: continue
-                
-                parts = [p.strip() for p in line.split('|')]
-                tag = parts[0]
-                line_upper = line.upper()
-                target_product = "UNKNOWN"
-                
-                for p_name, variants in product_map.items():
-                    if any(v in line_upper for v in (variants + [p_name])):
-                        target_product = p_name
-                        break
-                
-                row = {'timestamp': t, 'tag': tag, 'target_product': target_product}
-                
-                for p in parts[1:]:
-                    if ':' in p:
-                        kv = p.split(':', 1)
-                        key = kv[0].strip().lower().replace(" ", "_")
-                        val = kv[1].strip()
-                        try:
-                            row[key] = float(val)
-                        except:
-                            row[key] = val
+            log_text, state_positions = extract_lambda_text_and_positions(entry.get('lambdaLog', ''))
+
+            for line in log_text.splitlines():
+                row = parse_telemetry_line(line)
+                if row is None:
+                    continue
+                row['timestamp'] = t
+                logged_position = state_positions.get(row['target_product'])
+                if logged_position is not None:
+                    row['logged_position'] = logged_position
                 telemetry_rows.append(row)
                 
         df_telemetry = pd.DataFrame(telemetry_rows)
@@ -506,14 +576,214 @@ def calculate_exact_position(df_market_product, df_trades_product):
     df_market_product = df_market_product.reset_index()
     return df_market_product
 
+def prefer_logged_position(df_market_product, df_telemetry, selected_product):
+    df_market_product['reconstructed_position'] = df_market_product['exact_position']
+    df_market_product['position_source'] = 'tradeHistory'
+
+    if df_telemetry.empty or 'logged_position' not in df_telemetry.columns:
+        return df_market_product
+
+    logged = df_telemetry[df_telemetry['target_product'] == selected_product][['timestamp', 'logged_position']].copy()
+    if logged.empty:
+        return df_market_product
+
+    logged['logged_position'] = pd.to_numeric(logged['logged_position'], errors='coerce')
+    logged = logged.dropna(subset=['logged_position']).groupby('timestamp', as_index=False).last()
+    if logged.empty:
+        return df_market_product
+
+    df_market_product = pd.merge(df_market_product, logged, on='timestamp', how='left')
+    has_logged_position = df_market_product['logged_position'].notna()
+    df_market_product.loc[has_logged_position, 'exact_position'] = df_market_product.loc[has_logged_position, 'logged_position']
+    df_market_product.loc[has_logged_position, 'position_source'] = 'lambdaLog'
+    return df_market_product
+
+def build_product_frames(df_market, df_trades, df_telemetry):
+    frames = {}
+    for product in df_market['product'].unique():
+        df_mkt_product = df_market[df_market['product'] == product].copy()
+        if df_trades.empty:
+            df_trades_product = pd.DataFrame()
+        else:
+            df_trades_product = df_trades[df_trades['product'] == product].copy()
+        df_mkt_product = calculate_exact_position(df_mkt_product, df_trades_product)
+        frames[product] = prefer_logged_position(df_mkt_product, df_telemetry, product)
+    return frames
+
+def max_drawdown_abs(pnl_series):
+    if pnl_series.empty:
+        return 0.0
+    return abs((pnl_series - pnl_series.cummax()).min())
+
+def pnl_buckets(df, bucket_count=5):
+    if df.empty:
+        return []
+
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    chunks = [df.iloc[idx] for idx in np.array_split(np.arange(len(df)), min(bucket_count, len(df))) if len(idx) > 0]
+    rows = []
+    prev_pnl = 0.0
+
+    for i, chunk in enumerate(chunks, start=1):
+        end_pnl = float(chunk['profit_and_loss'].iloc[-1])
+        bucket_pnl = end_pnl - prev_pnl
+        rows.append({
+            'bucket': f'B{i}',
+            'start': int(chunk['timestamp'].iloc[0]),
+            'end': int(chunk['timestamp'].iloc[-1]),
+            'bucket_pnl': bucket_pnl
+        })
+        prev_pnl = end_pnl
+
+    return rows
+
+def portfolio_curve(df_market):
+    curve = df_market.pivot_table(index='timestamp', columns='product', values='profit_and_loss', aggfunc='last')
+    curve = curve.sort_index().ffill().fillna(0)
+    return curve.sum(axis=1)
+
+def summarize_products(product_frames):
+    rows = []
+    for product, df in product_frames.items():
+        limit = LIMITS.get(product, 80)
+        final_pnl = float(df['profit_and_loss'].iloc[-1]) if not df.empty else 0.0
+        max_dd = max_drawdown_abs(df['profit_and_loss']) if not df.empty else 0.0
+        abs_pos = df['exact_position'].abs() if not df.empty else pd.Series(dtype=float)
+        avg_abs_pos = float(abs_pos.mean()) if not abs_pos.empty else 0.0
+        max_abs_pos = float(abs_pos.max()) if not abs_pos.empty else 0.0
+        near_50 = float((abs_pos >= 0.50 * limit).mean() * 100) if not abs_pos.empty else 0.0
+        near_75 = float((abs_pos >= 0.75 * limit).mean() * 100) if not abs_pos.empty else 0.0
+        near_90 = float((abs_pos >= 0.90 * limit).mean() * 100) if not abs_pos.empty else 0.0
+        buckets = pnl_buckets(df)
+        worst_bucket = min((b['bucket_pnl'] for b in buckets), default=0.0)
+        negative_buckets = sum(1 for b in buckets if b['bucket_pnl'] < 0)
+        rows.append({
+            'product': product,
+            'final_pnl': final_pnl,
+            'max_dd': max_dd,
+            'pnl_dd': final_pnl / max_dd if max_dd > 0 else np.nan,
+            'avg_abs_pos': avg_abs_pos,
+            'max_abs_pos': max_abs_pos,
+            'pnl_avg_abs_pos': final_pnl / avg_abs_pos if avg_abs_pos > 0 else np.nan,
+            'near_50_pct': near_50,
+            'near_75_pct': near_75,
+            'near_90_pct': near_90,
+            'worst_bucket': worst_bucket,
+            'negative_buckets': negative_buckets
+        })
+
+    return pd.DataFrame(rows).sort_values('final_pnl', ascending=False).reset_index(drop=True)
+
+def format_metric_number(value, decimals=1):
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:,.{decimals}f}"
+
+def plot_pnl_bucket_stability(product_frames):
+    bucket_rows = []
+    for product, df in product_frames.items():
+        for row in pnl_buckets(df):
+            bucket_rows.append({'product': product, **row})
+
+    if not bucket_rows:
+        return go.Figure()
+
+    bucket_df = pd.DataFrame(bucket_rows)
+    pivot = bucket_df.pivot(index='product', columns='bucket', values='bucket_pnl').fillna(0)
+    text = pivot.map(lambda v: f"{v:,.0f}") if hasattr(pivot, 'map') else pivot.applymap(lambda v: f"{v:,.0f}")
+
+    max_abs = max(abs(pivot.min().min()), abs(pivot.max().max()), 1)
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=pivot.columns,
+        y=pivot.index,
+        text=text.values,
+        texttemplate="%{text}",
+        colorscale=[[0.0, LOSS_RED], [0.5, PANEL_BG], [1.0, PROFIT_GREEN]],
+        zmid=0,
+        zmin=-max_abs,
+        zmax=max_abs,
+        colorbar=dict(title="PnL")
+    ))
+    fig.update_layout(
+        title=dict(text="PNL BUCKET STABILITY — 5 EQUAL TIME WINDOWS", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
+        font=dict(color="#ffffff", family="JetBrains Mono"),
+        xaxis=dict(title="", tickfont=dict(size=9, color="#ffffff")),
+        yaxis=dict(title="", tickfont=dict(size=9, color="#ffffff")),
+        margin=dict(l=0, r=40, t=40, b=0)
+    )
+    return fig
+
+def render_portfolio_submission_summary(df_market, product_frames):
+    product_summary = summarize_products(product_frames)
+    portfolio_pnl = portfolio_curve(df_market)
+    portfolio_final_pnl = float(portfolio_pnl.iloc[-1]) if not portfolio_pnl.empty else 0.0
+    portfolio_max_dd = max_drawdown_abs(portfolio_pnl)
+    sandbox_messages = df_market.attrs.get('sandbox_message_count', 0)
+    adjusted_final_profit = df_market.attrs.get('adjusted_final_profit')
+    worst_drag = product_summary.sort_values('final_pnl').iloc[0] if not product_summary.empty else None
+    best_concentration = (product_summary['final_pnl'].max() / portfolio_final_pnl * 100) if portfolio_final_pnl > 0 and not product_summary.empty else np.nan
+    port_color = "pos" if portfolio_final_pnl >= 0 else "neg"
+    dd_color = "neg" if portfolio_max_dd > 0 else ""
+    msg_color = "amber" if sandbox_messages > 0 else "pos"
+    concentration_sub = "best product / total PnL" if not pd.isna(best_concentration) else "not meaningful if total PnL <= 0"
+    worst_name = worst_drag['product'] if worst_drag is not None else "N/A"
+    worst_value = worst_drag['final_pnl'] if worst_drag is not None else np.nan
+    final_pnl_sub = f"stored final: {adjusted_final_profit:,.0f} $" if adjusted_final_profit is not None else "all products"
+    st.markdown('<div class="section-label">🏁&nbsp;&nbsp;PORTFOLIO SUBMISSION SUMMARY</div>', unsafe_allow_html=True)
+
+    st.markdown(f"""
+        <div class="metric-grid-5">
+            {metric_card("TOTAL OFFICIAL PNL", f"{portfolio_final_pnl:,.0f} $", final_pnl_sub, port_color, "cyan")}
+            {metric_card("PORTFOLIO MAX DD", f"{portfolio_max_dd:,.0f} $", "from official PnL curve", dd_color, "red")}
+            {metric_card("WORST PRODUCT", worst_name, f"{format_metric_number(worst_value, 0)} $", "neg" if worst_value < 0 else "", "amber")}
+            {metric_card("BEST CONCENTRATION", f"{format_metric_number(best_concentration, 1)}%", concentration_sub, "amber" if not pd.isna(best_concentration) and best_concentration > 80 else "", "")}
+            {metric_card("SANDBOX MSGS", f"{sandbox_messages}", "non-empty sandbox logs", msg_color, "amber" if sandbox_messages > 0 else "green")}
+        </div>
+    """, unsafe_allow_html=True)
+
+    table_cols = {
+        'product': 'Product',
+        'final_pnl': 'Final PnL',
+        'max_dd': 'Max DD',
+        'pnl_dd': 'PnL/DD',
+        'avg_abs_pos': 'Avg |Pos|',
+        'max_abs_pos': 'Max |Pos|',
+        'near_75_pct': '>=75% Limit',
+        'near_90_pct': '>=90% Limit',
+        'worst_bucket': 'Worst Bucket',
+        'negative_buckets': 'Neg Buckets'
+    }
+    product_table = product_summary[list(table_cols.keys())].rename(columns=table_cols)
+    st.dataframe(
+        product_table.style.format({
+            'Final PnL': '{:,.0f}',
+            'Max DD': '{:,.0f}',
+            'PnL/DD': '{:,.2f}',
+            'Avg |Pos|': '{:,.1f}',
+            'Max |Pos|': '{:,.0f}',
+            '>=75% Limit': '{:,.1f}%',
+            '>=90% Limit': '{:,.1f}%',
+            'Worst Bucket': '{:,.0f}',
+            'Neg Buckets': '{:,.0f}'
+        }),
+        width='stretch',
+        hide_index=True
+    )
+
+    st.plotly_chart(plot_pnl_bucket_stability(product_frames), width='stretch')
+
 # --- VISUALIZATIONS (logic unchanged, colors updated to match new theme) ---
 def plot_pnl_inventory(df, selected_product):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     limit = LIMITS.get(selected_product, 80)
+    position_source = df['position_source'] if 'position_source' in df.columns else pd.Series(['tradeHistory'] * len(df), index=df.index)
+    hover_data = np.stack([df['exact_position'], position_source], axis=-1)
     
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Cumulative PnL", line=dict(color=IMC_BLUE, width=2), hoverinfo='skip'), secondary_y=False)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['exact_position'], name="Inventory (+/-)", fill='tozeroy', line=dict(color='#556677', width=1, shape='hv'), fillcolor='rgba(85, 102, 119, 0.15)', hoverinfo='skip'), secondary_y=True)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Metrics", mode='lines', line=dict(color='rgba(0,0,0,0)'), customdata=df['exact_position'], hovertemplate="PnL: %{y:,.0f} Xirecs<br>Inventory: %{customdata} Lots<extra></extra>", showlegend=False), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Metrics", mode='lines', line=dict(color='rgba(0,0,0,0)'), customdata=hover_data, hovertemplate="PnL: %{y:,.0f} Xirecs<br>Inventory: %{customdata[0]} Lots<br>Position source: %{customdata[1]}<extra></extra>", showlegend=False), secondary_y=False)
     
     fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=limit, y1=limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
     fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=-limit, y1=-limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
@@ -580,7 +850,7 @@ def plot_microstructure_xray(df_mkt, df_trd):
         add_exec(t_sell, "TAKER SOLD",   LOSS_RED,     'circle',        True)
 
     fig.update_layout(
-        title=dict(text="MICROSTRUCTURE X-RAY — EXECUTIONS vs. TRUE PRICE", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        title=dict(text="MICROSTRUCTURE X-RAY — EXECUTIONS vs. BOOK MID", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
         plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
         font=dict(color="#ffffff", family="JetBrains Mono"),
         xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
@@ -810,7 +1080,7 @@ def plot_true_mid_divergence(df_mkt):
     
     df = df_mkt.copy()
     
-    # Calculate True Mid based on L3 (The Wall) with graceful degradation
+    # Calculate an L3 wall-mid candidate with graceful degradation.
     
     # BIDS
     l2_bid = df['bid_price_2'].fillna(df['bid_price_1'])
@@ -824,17 +1094,17 @@ def plot_true_mid_divergence(df_mkt):
     
     fig = go.Figure()
     
-    # Fake Mid (Noisy, Pennying)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], mode='lines', name='L1 Mid (Fade)', line=dict(color='#556677', width=1, dash='dot'), opacity=0.8, hovertemplate="Fake Mid: %{y:.1f}<extra></extra>"))
+    # L1 mid can be noisy when best quotes are being pennyed.
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], mode='lines', name='L1 Mid', line=dict(color='#556677', width=1, dash='dot'), opacity=0.8, hovertemplate="L1 Mid: %{y:.1f}<extra></extra>"))
     
-    # True Mid (Wall Mid, Structural)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['wall_mid'], mode='lines', name='L3 Wall Mid (True)', line=dict(color=IMC_BLUE, width=2), hovertemplate="True Mid: %{y:.1f}<extra></extra>"))
+    # Candidate structural mid, not ground truth.
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['wall_mid'], mode='lines', name='L3 Wall Mid Candidate', line=dict(color=IMC_BLUE, width=2), hovertemplate="L3 Wall Mid: %{y:.1f}<extra></extra>"))
     
     # Shade the divergence (when L1 Mid disconnects from Wall Mid)
     df['divergence'] = df['mid_price'] - df['wall_mid']
     
     fig.update_layout(
-        title=dict(text=f"L3 WALL MID vs. L1 MID DIVERGENCE", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        title=dict(text=f"L3 WALL MID CANDIDATE vs. L1 MID", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
         plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
         font=dict(color="#ffffff", family="JetBrains Mono"),
         xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
@@ -896,160 +1166,6 @@ def plot_vwap_momentum(df_mkt, df_trd, rolling_window=10):
         xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
         yaxis=dict(title=dict(text="VWAP vs Mid (Ticks)", font=dict(color="#ffffff")), zeroline=True, zerolinewidth=1, zerolinecolor=GRID_COLOR, showgrid=True, gridcolor=GRID_COLOR, tickfont=dict(size=9, color="#ffffff")),
         showlegend=False,
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
-    )
-    return fig
-
-def plot_telemetry_brainwaves(df_mkt, df_trd, df_tel, selected_signals):
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    if df_mkt.empty: return fig
-    
-    # 1. Baseline: Market Mid Price
-    fig.add_trace(
-        go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='L1 Mid Price', line=dict(color='#f0f4f8', width=2), opacity=0.7),
-        secondary_y=False
-    )
-    
-    # 2. Executions (To see EXACTLY when the bot acted based on the signals)
-    if not df_trd.empty:
-        our_buys = df_trd[df_trd['is_our_buy']]
-        our_sells = df_trd[df_trd['is_our_sell']]
-        
-        if not our_buys.empty:
-            fig.add_trace(go.Scatter(
-                x=our_buys['timestamp'], y=our_buys['price'], mode='markers', name='Our Buys',
-                marker=dict(symbol='triangle-up', size=10, color=PROFIT_GREEN, line=dict(width=1, color='white')),
-                hovertemplate="BOUGHT %{text} @ %{y}<extra></extra>", text=our_buys['quantity']
-            ), secondary_y=False)
-            
-        if not our_sells.empty:
-            fig.add_trace(go.Scatter(
-                x=our_sells['timestamp'], y=our_sells['price'], mode='markers', name='Our Sells',
-                marker=dict(symbol='triangle-down', size=10, color=LOSS_RED, line=dict(width=1, color='white')),
-                hovertemplate="SOLD %{text} @ %{y}<extra></extra>", text=our_sells['quantity']
-            ), secondary_y=False)
-
-    # 3. The Brainwaves (Telemetry Signals)
-    if not df_tel.empty and selected_signals:
-        # Get typical market price to determine if a signal needs a secondary axis
-        avg_price = df_mkt['mid_price'].mean() if not df_mkt['mid_price'].isna().all() else 10000
-        
-        color_palette = [IMC_BLUE, '#a855f7', '#06d6a0', '#f59e0b', '#ff6b6b', '#4ecdc4', '#ffe66d']
-        
-        for i, sig in enumerate(selected_signals):
-            if sig not in df_tel.columns: continue
-            
-            sig_data = df_tel[['timestamp', sig]].dropna()
-            if sig_data.empty: continue
-            
-            # Determine Axis
-            # If the signal's mean magnitude is tiny compared to the price (e.g., a Z-Score of 2.5 vs a price of 10000), 
-            # or if it's negative, put it on the secondary Y-axis.
-            sig_mean_abs = sig_data[sig].abs().mean()
-            use_secondary = False
-            
-            if sig_mean_abs < (avg_price * 0.1) or sig_data[sig].min() < 0:
-                use_secondary = True
-                
-            line_color = color_palette[i % len(color_palette)]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=sig_data['timestamp'], y=sig_data[sig], 
-                    mode='lines', name=sig.upper(), 
-                    line=dict(color=line_color, width=1.5, dash='solid' if not use_secondary else 'dot'),
-                    hovertemplate=f"{sig.upper()}: %{{y:.3f}}<extra></extra>"
-                ),
-                secondary_y=use_secondary
-            )
-
-    fig.update_layout(
-        title=dict(text="LOG YOUR INTERNAL VARS SO YOU CAN SEE HOW YOUR ALGO OPERATES<br><span style='font-size:9px; color:#8899aa; font-weight:400;'>REQUIRED FORMAT: [TAG] | PROD: ASSET_NAME | MY_ALPHA: 123.45 | Z_SCORE: 2.1</span>", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Price / Fair Value", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Oscillators / Z-Scores", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
-        margin=dict(l=0, r=40, t=40, b=0),
-        hovermode="x unified"
-    )
-    return fig
-
-def plot_telemetry_brainwaves(df_mkt, df_trd, df_tel, selected_signals):
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    if df_mkt.empty: return fig
-    
-    # 1. Baseline: Market Mid Price
-    fig.add_trace(
-        go.Scatter(x=df_mkt['timestamp'], y=df_mkt['mid_price'], mode='lines', name='L1 Mid Price', line=dict(color='#f0f4f8', width=2), opacity=0.7),
-        secondary_y=False
-    )
-    
-    # 2. Executions (To see EXACTLY when the bot acted based on the signals)
-    if not df_trd.empty:
-        our_buys = df_trd[df_trd['is_our_buy']]
-        our_sells = df_trd[df_trd['is_our_sell']]
-        
-        if not our_buys.empty:
-            fig.add_trace(go.Scatter(
-                x=our_buys['timestamp'], y=our_buys['price'], mode='markers', name='Our Buys',
-                marker=dict(symbol='triangle-up', size=10, color=PROFIT_GREEN, line=dict(width=1, color='white')),
-                hovertemplate="BOUGHT %{text} @ %{y}<extra></extra>", text=our_buys['quantity']
-            ), secondary_y=False)
-            
-        if not our_sells.empty:
-            fig.add_trace(go.Scatter(
-                x=our_sells['timestamp'], y=our_sells['price'], mode='markers', name='Our Sells',
-                marker=dict(symbol='triangle-down', size=10, color=LOSS_RED, line=dict(width=1, color='white')),
-                hovertemplate="SOLD %{text} @ %{y}<extra></extra>", text=our_sells['quantity']
-            ), secondary_y=False)
-
-    # 3. The Brainwaves (Telemetry Signals)
-    if not df_tel.empty and selected_signals:
-        # Get typical market price to determine if a signal needs a secondary axis
-        avg_price = df_mkt['mid_price'].mean() if not df_mkt['mid_price'].isna().all() else 10000
-        
-        color_palette = [IMC_BLUE, '#a855f7', '#06d6a0', '#f59e0b', '#ff6b6b', '#4ecdc4', '#ffe66d']
-        
-        for i, sig in enumerate(selected_signals):
-            if sig not in df_tel.columns: continue
-            
-            sig_data = df_tel[['timestamp', sig]].dropna()
-            if sig_data.empty: continue
-            
-            # Determine Axis
-            # If the signal's mean magnitude is tiny compared to the price (e.g., a Z-Score of 2.5 vs a price of 10000), 
-            # or if it's negative, put it on the secondary Y-axis.
-            sig_mean_abs = sig_data[sig].abs().mean()
-            use_secondary = False
-            
-            if sig_mean_abs < (avg_price * 0.1) or sig_data[sig].min() < 0:
-                use_secondary = True
-                
-            line_color = color_palette[i % len(color_palette)]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=sig_data['timestamp'], y=sig_data[sig], 
-                    mode='lines', name=sig.upper(), 
-                    line=dict(color=line_color, width=1.5, dash='solid' if not use_secondary else 'dot'),
-                    hovertemplate=f"{sig.upper()}: %{{y:.3f}}<extra></extra>"
-                ),
-                secondary_y=use_secondary
-            )
-
-    fig.update_layout(
-        title=dict(text="LOG YOUR INTERNAL VARS SO YOU CAN SEE HOW YOUR ALGO OPERATES<br><span style='font-size:9px; color:#8899aa; font-weight:400;'>REQUIRED FORMAT: [TAG] | PROD: ASSET_NAME | MY_ALPHA: 123.45 | Z_SCORE: 2.1</span>", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
-        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
-        font=dict(color="#ffffff", family="JetBrains Mono"),
-        xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df_mkt['timestamp'].max()], tickfont=dict(size=9, color="#ffffff")),
-        yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="Price / Fair Value", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Oscillators / Z-Scores", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
         margin=dict(l=0, r=40, t=40, b=0),
         hovermode="x unified"
     )
@@ -1216,7 +1332,9 @@ vwap_window = st.sidebar.slider(
 
 
 if selected_product:
-    df_mkt_prod = df_market[df_market['product'] == selected_product].copy()
+    product_frames = build_product_frames(df_market, df_trades, df_telemetry)
+
+    df_mkt_prod = product_frames[selected_product].copy()
     if not df_trades.empty:
         df_trd_prod = df_trades[df_trades['product'] == selected_product].copy()
         df_mkt_l1 = df_mkt_prod[['timestamp', 'bid_price_1', 'ask_price_1']].copy().dropna()
@@ -1226,7 +1344,6 @@ if selected_product:
         df_trd_prod.loc[df_trd_prod['is_our_sell'] & (df_trd_prod['price'] <= df_trd_prod['bid_price_1']), 'is_taker'] = True
     else:
         df_trd_prod = pd.DataFrame()
-    df_mkt_prod = calculate_exact_position(df_mkt_prod, df_trd_prod)
     
     # --- METRIC CALCULATIONS ---
     final_pnl = df_mkt_prod['profit_and_loss'].iloc[-1]
@@ -1267,8 +1384,19 @@ if selected_product:
         else: spread_capture = 0
     else: spread_capture = 0
     limit = LIMITS.get(selected_product, 80)
-    time_locked = np.mean(np.abs(df_mkt_prod['exact_position'].values) >= limit) * 100
+    abs_position = df_mkt_prod['exact_position'].abs()
+    time_locked = np.mean(abs_position.values >= limit) * 100
+    near_50 = np.mean(abs_position.values >= 0.50 * limit) * 100
+    near_75 = np.mean(abs_position.values >= 0.75 * limit) * 100
+    near_90 = np.mean(abs_position.values >= 0.90 * limit) * 100
+    max_abs_position = abs_position.max()
+    avg_abs_position = abs_position.mean()
     skew_bias = df_mkt_prod['exact_position'].mean()
+    pnl_per_max_dd = final_pnl / max_drawdown if max_drawdown > 0 else np.nan
+    pnl_per_avg_abs_position = final_pnl / avg_abs_position if avg_abs_position > 0 else np.nan
+    selected_buckets = pnl_buckets(df_mkt_prod)
+    worst_selected_bucket = min((b['bucket_pnl'] for b in selected_buckets), default=0.0)
+    negative_selected_buckets = sum(1 for b in selected_buckets if b['bucket_pnl'] < 0)
 
     adv_selection, win_rate, info_ratio = 0, 0, 0
     m_trades = pd.DataFrame()
@@ -1305,13 +1433,14 @@ if selected_product:
         
         m_color = "#3FB950" if maker_pnl >= 0 else "#F85149"
         t_color = "#3FB950" if taker_pnl >= 0 else "#F85149"
-        pnl_subtext = f"M: <span style='color:{m_color}; font-weight:600;'>{maker_pnl:,.0f}</span> | T: <span style='color:{t_color}; font-weight:600;'>{taker_pnl:,.0f}</span>"
+        pnl_tooltip = "M/T values mark trades to final mid; not official realized PnL attribution."
+        pnl_subtext = f"<span title='{pnl_tooltip}'>M: <span style='color:{m_color}; font-weight:600;'>{maker_pnl:,.0f}</span> | T: <span style='color:{t_color}; font-weight:600;'>{taker_pnl:,.0f}</span></span>"
         
         st.markdown(f"""
             <div class="metric-grid-5">
                 {metric_card("FINAL PNL", f"{final_pnl:,.0f} $", pnl_subtext, pnl_color, "cyan")}
                 {metric_card("VOLUME TRADED", f"{total_vol:,.0f}", "Lots", "", "")}
-                {metric_card("PNL PER LOT", f"{pnl_per_lot:,.2f}", "Xirecs / Lot", ppl_color, "purple")}
+                {metric_card("PNL PER LOT", f"{pnl_per_lot:,.2f} $", "Xirecs / Lot", ppl_color, "purple")}
                 {metric_card("% MAKER FILLS", f"{maker_pct:.1f}%", "of total volume", "", "")}
                 {metric_card("SPREAD CAPTURE", f"{spread_capture:.1f}%", "avg per trade", "", "amber")}
             </div>
@@ -1334,7 +1463,30 @@ if selected_product:
             </div>
         """, unsafe_allow_html=True)
 
-        # Row 3: Advanced Forensics
+        # Row 3: Position & Risk Efficiency
+        st.markdown('<div class="section-label">📉&nbsp;&nbsp;POSITION & RISK EFFICIENCY</div>', unsafe_allow_html=True)
+
+        near75_color = "neg" if near_75 > 25 else ("amber" if near_75 > 5 else "pos")
+        near90_color = "neg" if near_90 > 10 else ("amber" if near_90 > 2 else "pos")
+        risk_color = "pos" if not pd.isna(pnl_per_max_dd) and pnl_per_max_dd >= 3 else ("amber" if not pd.isna(pnl_per_max_dd) and pnl_per_max_dd >= 1 else "neg")
+        inv_eff_color = "pos" if not pd.isna(pnl_per_avg_abs_position) and pnl_per_avg_abs_position > 0 else ("neg" if not pd.isna(pnl_per_avg_abs_position) and pnl_per_avg_abs_position < 0 else "")
+        bucket_color = "neg" if worst_selected_bucket < 0 else "pos"
+
+        st.markdown(f"""
+            <div class="metric-grid-4">
+                {metric_card("TIME >= 50% LIMIT", f"{near_50:.1f}%", "early inventory pressure", "amber" if near_50 > 25 else "", "")}
+                {metric_card("TIME >= 75% LIMIT", f"{near_75:.1f}%", "near lockup zone", near75_color, "amber")}
+                {metric_card("TIME >= 90% LIMIT", f"{near_90:.1f}%", "danger zone", near90_color, "red")}
+                {metric_card("AVG ABS POSITION", f"{avg_abs_position:,.1f}", "risk carried", "amber" if avg_abs_position >= 0.50 * limit else "", "")}
+            </div>
+            <div class="metric-grid-3">
+                {metric_card("PNL / MAX DD", format_metric_number(pnl_per_max_dd, 2), "higher is cleaner", risk_color, "cyan")}
+                {metric_card("PNL / AVG ABS POS", format_metric_number(pnl_per_avg_abs_position, 1), "PnL per lot carried", inv_eff_color, "purple")}
+                {metric_card("WORST PNL BUCKET", f"{worst_selected_bucket:,.0f} $", f"{negative_selected_buckets} negative buckets", bucket_color, "red")}
+            </div>
+        """, unsafe_allow_html=True)
+
+        # Row 4: Advanced Forensics
         st.markdown('<div class="section-label">📊&nbsp;&nbsp;ADVANCED FORENSICS</div>', unsafe_allow_html=True)
 
     as_color = "neg" if adv_selection > 30 else ("amber" if adv_selection > 20 else "pos")
@@ -1408,6 +1560,9 @@ if selected_product:
     # Render plot into the container
     with telemetry_plot_container:
         st.plotly_chart(plot_telemetry_brainwaves(df_mkt_prod, df_trd_prod, df_tel_prod, selected_signals), width='stretch')
+
+    st.markdown("---")
+    render_portfolio_submission_summary(df_market, product_frames)
 
 else:
     st.markdown("""
