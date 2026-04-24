@@ -778,12 +778,10 @@ def render_portfolio_submission_summary(df_market, product_frames):
 def plot_pnl_inventory(df, selected_product):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     limit = LIMITS.get(selected_product, 80)
-    position_source = df['position_source'] if 'position_source' in df.columns else pd.Series(['tradeHistory'] * len(df), index=df.index)
-    hover_data = np.stack([df['exact_position'], position_source], axis=-1)
     
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Cumulative PnL", line=dict(color=IMC_BLUE, width=2), hoverinfo='skip'), secondary_y=False)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['exact_position'], name="Inventory (+/-)", fill='tozeroy', line=dict(color='#556677', width=1, shape='hv'), fillcolor='rgba(85, 102, 119, 0.15)', hoverinfo='skip'), secondary_y=True)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Metrics", mode='lines', line=dict(color='rgba(0,0,0,0)'), customdata=hover_data, hovertemplate="PnL: %{y:,.0f} Xirecs<br>Inventory: %{customdata[0]} Lots<br>Position source: %{customdata[1]}<extra></extra>", showlegend=False), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Metrics", mode='lines', line=dict(color='rgba(0,0,0,0)'), customdata=df['exact_position'], hovertemplate="PnL: %{y:,.0f} Xirecs<br>Inventory: %{customdata} Lots<extra></extra>", showlegend=False), secondary_y=False)
     
     fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=limit, y1=limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
     fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=-limit, y1=-limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
