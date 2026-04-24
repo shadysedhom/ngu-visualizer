@@ -799,7 +799,7 @@ def render_portfolio_submission_summary(df_market, product_frames):
         hide_index=True
     )
 
-    st.plotly_chart(plot_pnl_bucket_stability(product_frames), width='stretch')
+    st.plotly_chart(plot_pnl_bucket_stability(product_frames), width='stretch', key="portfolio_pnl_bucket_stability")
 
 # --- VISUALIZATIONS (logic unchanged, colors updated to match new theme) ---
 def plot_pnl_inventory(df, selected_product):
@@ -1528,32 +1528,33 @@ if selected_product:
     """, unsafe_allow_html=True)
 
     # ---- MACRO CHARTS ----
-    st.plotly_chart(plot_pnl_inventory(df_mkt_prod, selected_product), width='stretch')
-    st.plotly_chart(plot_microstructure_xray(df_mkt_prod, df_trd_prod), width='stretch')
+    chart_key_prefix = selected_product.replace(" ", "_").replace("/", "_")
+    st.plotly_chart(plot_pnl_inventory(df_mkt_prod, selected_product), width='stretch', key=f"{chart_key_prefix}_pnl_inventory")
+    st.plotly_chart(plot_microstructure_xray(df_mkt_prod, df_trd_prod), width='stretch', key=f"{chart_key_prefix}_microstructure_xray")
     
     st.markdown("---")
     st.markdown('<div class="section-label">🤖&nbsp;&nbsp;BOT BEHAVIOR & FLOW DYNAMICS</div>', unsafe_allow_html=True)
     
     c5, c6 = st.columns(2)
-    with c5: st.plotly_chart(plot_magic_size_fingerprinter(df_mkt_prod, df_trd_prod, markout_horizon), width='stretch')
-    with c6: st.plotly_chart(plot_liquidation_radar(df_mkt_prod, df_trd_prod), width='stretch')
+    with c5: st.plotly_chart(plot_magic_size_fingerprinter(df_mkt_prod, df_trd_prod, markout_horizon), width='stretch', key=f"{chart_key_prefix}_magic_size")
+    with c6: st.plotly_chart(plot_liquidation_radar(df_mkt_prod, df_trd_prod), width='stretch', key=f"{chart_key_prefix}_liquidation_radar")
     
     st.markdown("---")
     st.markdown('<div class="section-label">🎯&nbsp;&nbsp;MOMENTUM & WALL ANALYTICS</div>', unsafe_allow_html=True)
     
-    st.plotly_chart(plot_true_mid_divergence(df_mkt_prod), width='stretch')
-    st.plotly_chart(plot_vwap_momentum(df_mkt_prod, df_trd_prod, vwap_window), width='stretch')
+    st.plotly_chart(plot_true_mid_divergence(df_mkt_prod), width='stretch', key=f"{chart_key_prefix}_true_mid_divergence")
+    st.plotly_chart(plot_vwap_momentum(df_mkt_prod, df_trd_prod, vwap_window), width='stretch', key=f"{chart_key_prefix}_vwap_momentum")
     
     st.markdown("---")
     st.markdown('<div class="section-label">🔬&nbsp;&nbsp;EXECUTION & FLOW ANALYSIS</div>', unsafe_allow_html=True)
     
     c1, c2 = st.columns(2)
-    with c1: st.plotly_chart(plot_toxicity_markout(m_trades, markout_horizon), width='stretch')
-    with c2: st.plotly_chart(plot_spread_capture(m_trades, df_mkt_prod), width='stretch')
+    with c1: st.plotly_chart(plot_toxicity_markout(m_trades, markout_horizon), width='stretch', key=f"{chart_key_prefix}_toxicity_markout")
+    with c2: st.plotly_chart(plot_spread_capture(m_trades, df_mkt_prod), width='stretch', key=f"{chart_key_prefix}_spread_capture")
 
     c3, c4 = st.columns(2)
-    with c3: st.plotly_chart(plot_imbalance_matrix(m_trades, df_mkt_prod, imbalance_level), width='stretch')
-    with c4: st.plotly_chart(plot_whale_profiler(df_trd_prod), width='stretch')
+    with c3: st.plotly_chart(plot_imbalance_matrix(m_trades, df_mkt_prod, imbalance_level), width='stretch', key=f"{chart_key_prefix}_imbalance_matrix")
+    with c4: st.plotly_chart(plot_whale_profiler(df_trd_prod), width='stretch', key=f"{chart_key_prefix}_whale_profiler")
 
     st.markdown("---")
     st.markdown('<div class="section-label">🧠&nbsp;&nbsp;TELEMETRY & SIGNAL DIAGNOSTICS</div>', unsafe_allow_html=True)
@@ -1584,7 +1585,11 @@ if selected_product:
     
     # Render plot into the container
     with telemetry_plot_container:
-        st.plotly_chart(plot_telemetry_brainwaves(df_mkt_prod, df_trd_prod, df_tel_prod, selected_signals), width='stretch')
+        st.plotly_chart(
+            plot_telemetry_brainwaves(df_mkt_prod, df_trd_prod, df_tel_prod, selected_signals),
+            width='stretch',
+            key=f"{chart_key_prefix}_telemetry_brainwaves",
+        )
 
     st.markdown("---")
     render_portfolio_submission_summary(df_market, product_frames)
