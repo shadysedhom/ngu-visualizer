@@ -4,6 +4,7 @@ import numpy as np
 import json
 import io
 import re
+import math
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -420,6 +421,22 @@ LIMITS = {
     'VEV_6500': 300,
 }
 
+OPTION_PRODUCTS = [
+    'VEV_4000',
+    'VEV_4500',
+    'VEV_5000',
+    'VEV_5100',
+    'VEV_5200',
+    'VEV_5300',
+    'VEV_5400',
+    'VEV_5500',
+    'VEV_6000',
+    'VEV_6500',
+]
+UNDERLYING_PRODUCT = 'VELVETFRUIT_EXTRACT'
+DAYS_PER_YEAR = 365.0
+ROUND3_TTE_DAYS = 5.0
+
 PRODUCT_ALIASES = {
     'ASH_COATED_OSMIUM': ['OSM', 'ASH', 'OSMIUM'],
     'INTARIAN_PEPPER_ROOT': ['PEP', 'INT', 'PEPPER', 'ROOT'],
@@ -485,6 +502,8 @@ def parse_telemetry_line(line):
     if not parts:
         return None
 
+    compact_type = parts[0].strip()
+
     explicit_product = None
     for part in parts:
         if ':' not in part:
@@ -495,15 +514,32 @@ def parse_telemetry_line(line):
             explicit_product = raw_value.strip()
             break
 
+    if explicit_product is None and compact_type in {'P', 'H'}:
+        explicit_product = UNDERLYING_PRODUCT if compact_type == 'H' else 'PORTFOLIO'
     target_product = explicit_product or infer_product_from_telemetry_line(line)
-    tag = parts[0].split(':', 1)[0].strip()
+    tag = compact_type.split(':', 1)[0].strip()
     row = {'tag': tag, 'target_product': target_product}
+
+    compact_key_map = {
+        'p': 'prod',
+        'm': 'mode',
+        's': 'side',
+        'q': 'qty',
+        'e': 'edge',
+        'd': 'delta',
+        'v': 'vega',
+        'od': 'option_delta',
+        'rd': 'residual_delta',
+        'upos': 'underlying_position',
+        'tts': 'trade_ts',
+    }
 
     for part in parts:
         if ':' not in part:
             continue
         raw_key, raw_value = part.split(':', 1)
-        key = clean_telemetry_key(raw_key, target_product)
+        raw_key_clean = raw_key.strip().lower().replace(" ", "_")
+        key = compact_key_map.get(raw_key_clean, clean_telemetry_key(raw_key, target_product))
         if not key:
             continue
         value = raw_value.strip()
@@ -637,10 +673,331 @@ def build_product_frames(df_market, df_trades, df_telemetry):
         frames[product] = prefer_logged_position(df_mkt_product, df_telemetry, product)
     return frames
 
+def combined_limit(products):
+    return sum(LIMITS.get(product, 80) for product in products)
+
+def build_portfolio_frame(product_frames):
+    if not product_frames:
+        return pd.DataFrame()
+
+    pieces = []
+    for product, df in product_frames.items():
+        if df.empty:
+            continue
+        piece = df[['timestamp', 'profit_and_loss', 'exact_position']].copy()
+        piece = piece.rename(columns={
+            'profit_and_loss': f'pnl__{product}',
+            'exact_position': f'pos__{product}',
+        })
+        pieces.append(piece.set_index('timestamp'))
+
+    if not pieces:
+        return pd.DataFrame()
+
+    merged = pd.concat(pieces, axis=1).sort_index().ffill().fillna(0).reset_index()
+    pnl_cols = [col for col in merged.columns if col.startswith('pnl__')]
+    pos_cols = [col for col in merged.columns if col.startswith('pos__')]
+    out = pd.DataFrame({
+        'timestamp': merged['timestamp'],
+        'profit_and_loss': merged[pnl_cols].sum(axis=1),
+        'net_position': merged[pos_cols].sum(axis=1),
+        'exact_position': merged[pos_cols].abs().sum(axis=1),
+    })
+    return out
+
+def attach_book_context_to_trades(df_trades, product_frames, products):
+    if df_trades.empty:
+        return pd.DataFrame()
+
+    enriched = []
+    for product in products:
+        if product not in product_frames:
+            continue
+
+        trades = df_trades[df_trades['product'] == product].copy()
+        if trades.empty:
+            continue
+
+        mkt = product_frames[product].copy()
+        book_cols = ['timestamp', 'bid_price_1', 'ask_price_1', 'mid_price']
+        book = mkt[book_cols].copy().dropna(subset=['timestamp']).sort_values('timestamp')
+        trades = trades.sort_values('timestamp')
+
+        if book.empty:
+            trades['bid_price_1'] = np.nan
+            trades['ask_price_1'] = np.nan
+            trades['mid_price'] = np.nan
+        else:
+            trades = pd.merge_asof(trades, book, on='timestamp', direction='backward')
+
+        trades['final_mid'] = float(mkt['mid_price'].iloc[-1]) if 'mid_price' in mkt.columns and not mkt['mid_price'].empty else np.nan
+        trades['is_taker'] = False
+        trades.loc[trades['is_our_buy'] & (trades['price'] >= trades['ask_price_1']), 'is_taker'] = True
+        trades.loc[trades['is_our_sell'] & (trades['price'] <= trades['bid_price_1']), 'is_taker'] = True
+        enriched.append(trades)
+
+    if not enriched:
+        return pd.DataFrame()
+
+    return pd.concat(enriched, ignore_index=True).sort_values('timestamp').reset_index(drop=True)
+
+def build_markout_trades(our_trades, product_frames, markout_horizon):
+    if our_trades.empty:
+        return pd.DataFrame()
+
+    marked = []
+    for product, trades in our_trades.groupby('product'):
+        if product not in product_frames:
+            continue
+        df_mkt_future = product_frames[product][['timestamp', 'mid_price']].copy()
+        df_mkt_future['timestamp'] = df_mkt_future['timestamp'] - (markout_horizon * 100)
+        df_mkt_future = df_mkt_future.rename(columns={'mid_price': 'future_mid'})
+        product_markouts = pd.merge(trades, df_mkt_future, on='timestamp', how='inner')
+        if product_markouts.empty:
+            continue
+        product_markouts['m_edge'] = np.where(
+            product_markouts['is_our_buy'],
+            product_markouts['future_mid'] - product_markouts['price'],
+            product_markouts['price'] - product_markouts['future_mid'],
+        )
+        marked.append(product_markouts)
+
+    if not marked:
+        return pd.DataFrame()
+
+    return pd.concat(marked, ignore_index=True).sort_values('timestamp').reset_index(drop=True)
+
+def build_options_risk_frame(product_frames, selected_products):
+    option_products = [p for p in OPTION_PRODUCTS if p in product_frames and p in selected_products]
+    if UNDERLYING_PRODUCT not in product_frames or not option_products:
+        return pd.DataFrame(), option_products
+
+    under = product_frames[UNDERLYING_PRODUCT][['timestamp', 'mid_price', 'profit_and_loss', 'exact_position']].copy()
+    under = under.rename(columns={
+        'mid_price': 'spot',
+        'profit_and_loss': 'underlying_pnl',
+        'exact_position': 'underlying_position',
+    }).set_index('timestamp').sort_index().ffill()
+    risk = under.copy()
+    risk['voucher_pnl'] = 0.0
+    risk['option_delta'] = 0.0
+    risk['option_gamma'] = 0.0
+    risk['option_vega'] = 0.0
+    risk['gross_voucher_position'] = 0.0
+
+    for product in option_products:
+        frame = product_frames[product][['timestamp', 'mid_price', 'profit_and_loss', 'exact_position']].copy()
+        frame = frame.rename(columns={
+            'mid_price': f'mid__{product}',
+            'profit_and_loss': f'pnl__{product}',
+            'exact_position': f'pos__{product}',
+        }).set_index('timestamp').sort_index().ffill()
+        risk = risk.join(frame, how='left')
+        risk[[f'mid__{product}', f'pnl__{product}', f'pos__{product}']] = risk[[f'mid__{product}', f'pnl__{product}', f'pos__{product}']].ffill().fillna(0)
+
+        strike = strike_from_option(product)
+        tte = np.maximum((ROUND3_TTE_DAYS - risk.index.to_series().astype(float) / 1_000_000.0) / DAYS_PER_YEAR, 0.25 / DAYS_PER_YEAR).values
+        spot = risk['spot'].astype(float).values
+        mid = risk[f'mid__{product}'].astype(float).values
+        iv = np.array([implied_vol_scalar(price, s, strike, t) for price, s, t in zip(mid, spot, tte)])
+        iv = pd.Series(iv, index=risk.index).ffill().fillna(0.0001).values
+        delta, gamma, vega = bs_greeks_vector(spot, strike, tte, iv)
+        pos = risk[f'pos__{product}'].astype(float).values
+
+        risk[f'iv__{product}'] = iv
+        risk[f'delta__{product}'] = pos * delta
+        risk[f'gamma__{product}'] = pos * gamma
+        risk[f'vega__{product}'] = pos * vega
+        risk['voucher_pnl'] += risk[f'pnl__{product}']
+        risk['option_delta'] += risk[f'delta__{product}']
+        risk['option_gamma'] += risk[f'gamma__{product}']
+        risk['option_vega'] += risk[f'vega__{product}']
+        risk['gross_voucher_position'] += np.abs(pos)
+
+    risk['portfolio_delta'] = risk['option_delta'] + risk['underlying_position']
+    risk['portfolio_gamma'] = risk['option_gamma']
+    risk['portfolio_vega_1pct'] = risk['option_vega'] * 0.01
+    risk['combined_pnl'] = risk['voucher_pnl'] + risk['underlying_pnl']
+    return risk.reset_index(), option_products
+
+def options_drawdown_attribution(risk_df, product_frames, option_products):
+    if risk_df.empty:
+        return None, pd.DataFrame()
+    window = max_drawdown_window(risk_df.set_index('timestamp')['combined_pnl'])
+    if not window:
+        return None, pd.DataFrame()
+    peak_ts = window['peak_ts']
+    trough_ts = window['trough_ts']
+    peak_row = risk_df[risk_df['timestamp'] == peak_ts].iloc[0]
+    trough_row = risk_df[risk_df['timestamp'] == trough_ts].iloc[0]
+    spot_move = float(trough_row['spot'] - peak_row['spot'])
+    window['spot_move'] = spot_move
+    window['start_delta'] = float(peak_row['portfolio_delta'])
+    window['delta_estimate'] = float(peak_row['portfolio_delta'] * spot_move)
+    window['unexplained'] = float((trough_row['combined_pnl'] - peak_row['combined_pnl']) - window['delta_estimate'])
+
+    rows = []
+    for product in option_products + ([UNDERLYING_PRODUCT] if UNDERLYING_PRODUCT in product_frames else []):
+        frame = product_frames[product].set_index('timestamp').sort_index()
+        if peak_ts not in frame.index or trough_ts not in frame.index:
+            continue
+        start_pnl = float(frame.loc[peak_ts, 'profit_and_loss'])
+        end_pnl = float(frame.loc[trough_ts, 'profit_and_loss'])
+        start_pos = float(frame.loc[peak_ts, 'exact_position'])
+        end_pos = float(frame.loc[trough_ts, 'exact_position'])
+        rows.append({
+            'product': product,
+            'pnl_change': end_pnl - start_pnl,
+            'start_pnl': start_pnl,
+            'end_pnl': end_pnl,
+            'start_pos': start_pos,
+            'end_pos': end_pos,
+        })
+    return window, pd.DataFrame(rows).sort_values('pnl_change')
+
+def option_product_summary(product_frames, df_trades, option_products, drawdown_rows):
+    rows = []
+    dd_map = {}
+    if drawdown_rows is not None and not drawdown_rows.empty:
+        dd_map = dict(zip(drawdown_rows['product'], drawdown_rows['pnl_change']))
+
+    for product in option_products:
+        frame = product_frames[product]
+        trades = df_trades[df_trades['product'] == product].copy() if not df_trades.empty and 'product' in df_trades.columns else pd.DataFrame()
+        our = trades[(trades.get('is_our_buy', False)) | (trades.get('is_our_sell', False))].copy() if not trades.empty else pd.DataFrame()
+        buy_qty = int(our.loc[our['is_our_buy'], 'quantity'].sum()) if not our.empty else 0
+        sell_qty = int(our.loc[our['is_our_sell'], 'quantity'].sum()) if not our.empty else 0
+        avg_buy = (our.loc[our['is_our_buy'], 'price'] * our.loc[our['is_our_buy'], 'quantity']).sum() / buy_qty if buy_qty else np.nan
+        avg_sell = (our.loc[our['is_our_sell'], 'price'] * our.loc[our['is_our_sell'], 'quantity']).sum() / sell_qty if sell_qty else np.nan
+        abs_pos = frame['exact_position'].abs()
+        limit = LIMITS.get(product, 300)
+        rows.append({
+            'Product': product,
+            'Final PnL': float(frame['profit_and_loss'].iloc[-1]),
+            'DD Chg': float(dd_map.get(product, 0.0)),
+            'Final Pos': int(frame['exact_position'].iloc[-1]),
+            'Max Abs Pos': int(abs_pos.max()),
+            'Avg Abs Pos': float(abs_pos.mean()),
+            'Time >50% Lim': float((abs_pos >= 0.5 * limit).mean() * 100),
+            'Buy Qty': buy_qty,
+            'Sell Qty': sell_qty,
+            'Net Qty': buy_qty - sell_qty,
+            'Avg Buy': avg_buy,
+            'Avg Sell': avg_sell,
+        })
+    return pd.DataFrame(rows)
+
+def fill_quality_table(df_trades, product_frames, option_products):
+    enriched = attach_book_context_to_trades(df_trades, product_frames, option_products)
+    if enriched.empty:
+        return pd.DataFrame()
+    our = enriched[enriched['is_our_buy'] | enriched['is_our_sell']].copy()
+    if our.empty:
+        return pd.DataFrame()
+    rows = []
+    for horizon in [1, 10, 50, 100]:
+        marked = build_markout_trades(our, product_frames, horizon)
+        if marked.empty:
+            continue
+        marked['side'] = np.where(marked['is_our_buy'], 'BUY', 'SELL')
+        marked['style'] = np.where(marked['is_taker'], 'TAKE', 'MAKE')
+        grouped = marked.groupby(['product', 'side', 'style'])
+        for key, group in grouped:
+            qty = group['quantity'].sum()
+            edge = (group['m_edge'] * group['quantity']).sum() / qty if qty else np.nan
+            rows.append({'Product': key[0], 'Side': key[1], 'Style': key[2], 'Horizon': f'T+{horizon*100}', 'Qty': qty, 'Avg Markout': edge})
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    pivot = out.pivot_table(index=['Product', 'Side', 'Style'], columns='Horizon', values='Avg Markout', aggfunc='mean').reset_index()
+    qty = out.groupby(['Product', 'Side', 'Style'])['Qty'].max().reset_index()
+    return pd.merge(qty, pivot, on=['Product', 'Side', 'Style'], how='left').sort_values(['Product', 'Side', 'Style'])
+
 def max_drawdown_abs(pnl_series):
     if pnl_series.empty:
         return 0.0
     return abs((pnl_series - pnl_series.cummax()).min())
+
+def norm_cdf(x):
+    arr = np.asarray(x, dtype=float)
+    values = 0.5 * (1.0 + np.vectorize(math.erf)(arr / np.sqrt(2.0)))
+    return float(values) if values.shape == () else values
+
+def norm_pdf(x):
+    return np.exp(-0.5 * x * x) / np.sqrt(2.0 * np.pi)
+
+def bs_call_price(spot, strike, tte, sigma):
+    intrinsic = np.maximum(0.0, spot - strike)
+    vol_sqrt_t = sigma * np.sqrt(np.maximum(tte, 1e-9))
+    valid = (tte > 0) & (sigma > 0) & (spot > 0) & (strike > 0) & (vol_sqrt_t > 0)
+    price = intrinsic.astype(float) if hasattr(intrinsic, 'astype') else float(intrinsic)
+    if np.isscalar(price):
+        if not valid:
+            return price
+        d1 = (np.log(spot / strike) + 0.5 * sigma * sigma * tte) / vol_sqrt_t
+        d2 = d1 - vol_sqrt_t
+        return spot * norm_cdf(d1) - strike * norm_cdf(d2)
+    out = price.copy()
+    d1 = np.zeros_like(out, dtype=float)
+    d1[valid] = (np.log(spot[valid] / strike) + 0.5 * sigma[valid] * sigma[valid] * tte[valid]) / vol_sqrt_t[valid]
+    d2 = d1 - vol_sqrt_t
+    out[valid] = spot[valid] * norm_cdf(d1[valid]) - strike * norm_cdf(d2[valid])
+    return out
+
+def bs_greeks_vector(spot, strike, tte, sigma):
+    spot = np.asarray(spot, dtype=float)
+    tte = np.asarray(tte, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    vol_sqrt_t = sigma * np.sqrt(np.maximum(tte, 1e-9))
+    valid = (tte > 0) & (sigma > 0) & (spot > 0) & (strike > 0) & (vol_sqrt_t > 0)
+    delta = np.where(spot > strike, 1.0, 0.0).astype(float)
+    gamma = np.zeros_like(delta, dtype=float)
+    vega = np.zeros_like(delta, dtype=float)
+    if valid.any():
+        d1 = (np.log(spot[valid] / strike) + 0.5 * sigma[valid] * sigma[valid] * tte[valid]) / vol_sqrt_t[valid]
+        pdf = norm_pdf(d1)
+        delta[valid] = norm_cdf(d1)
+        gamma[valid] = pdf / (spot[valid] * vol_sqrt_t[valid])
+        vega[valid] = spot[valid] * pdf * np.sqrt(tte[valid])
+    return delta, gamma, vega
+
+def implied_vol_scalar(price, spot, strike, tte):
+    if pd.isna(price) or pd.isna(spot) or spot <= 0 or strike <= 0 or tte <= 0:
+        return np.nan
+    intrinsic = max(0.0, spot - strike)
+    if price <= intrinsic + 1e-9:
+        return 0.0001
+    lo, hi = 0.0001, 3.0
+    for _ in range(45):
+        mid = (lo + hi) / 2.0
+        value = bs_call_price(float(spot), float(strike), float(tte), mid)
+        if value < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+def strike_from_option(product):
+    try:
+        return float(product.rsplit('_', 1)[1])
+    except Exception:
+        return np.nan
+
+def max_drawdown_window(series):
+    if series.empty:
+        return None
+    running_peak = series.cummax()
+    drawdown = running_peak - series
+    trough_idx = drawdown.idxmax()
+    peak_candidates = series.loc[:trough_idx]
+    peak_idx = peak_candidates.idxmax()
+    return {
+        'peak_ts': int(peak_idx),
+        'trough_ts': int(trough_idx),
+        'peak_value': float(series.loc[peak_idx]),
+        'trough_value': float(series.loc[trough_idx]),
+        'drawdown': float(drawdown.loc[trough_idx]),
+    }
 
 def pnl_buckets(df, bucket_count=5):
     if df.empty:
@@ -802,18 +1159,21 @@ def render_portfolio_submission_summary(df_market, product_frames):
     st.plotly_chart(plot_pnl_bucket_stability(product_frames), width='stretch', key="portfolio_pnl_bucket_stability")
 
 # --- VISUALIZATIONS (logic unchanged, colors updated to match new theme) ---
-def plot_pnl_inventory(df, selected_product):
+def plot_pnl_inventory(df, selected_product, limit_override=None, inventory_label="Net Position (Lots)", show_negative_limit=True):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    limit = LIMITS.get(selected_product, 80)
+    limit = limit_override if limit_override is not None else LIMITS.get(selected_product, 80)
     
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Cumulative PnL", line=dict(color=IMC_BLUE, width=2), hoverinfo='skip'), secondary_y=False)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['exact_position'], name="Inventory (+/-)", fill='tozeroy', line=dict(color='#556677', width=1, shape='hv'), fillcolor='rgba(85, 102, 119, 0.15)', hoverinfo='skip'), secondary_y=True)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['profit_and_loss'], name="Metrics", mode='lines', line=dict(color='rgba(0,0,0,0)'), customdata=df['exact_position'], hovertemplate="PnL: %{y:,.0f} Xirecs<br>Inventory: %{customdata} Lots<extra></extra>", showlegend=False), secondary_y=False)
     
     fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=limit, y1=limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
-    fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=-limit, y1=-limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
     fig.add_annotation(x=1.0, y=limit, text=str(limit), showarrow=False, xref="paper", yref="y2", font=dict(color=LOSS_RED, size=12, family="JetBrains Mono"), xanchor="right", xshift=-5)
-    fig.add_annotation(x=1.0, y=-limit, text=str(-limit), showarrow=False, xref="paper", yref="y2", font=dict(color=LOSS_RED, size=12, family="JetBrains Mono"), xanchor="right", xshift=-5)
+    if show_negative_limit:
+        fig.add_shape(type="line", x0=0, x1=1, xref="x domain", y0=-limit, y1=-limit, yref="y2", line=dict(color=LOSS_RED, width=1, dash="dash"))
+        fig.add_annotation(x=1.0, y=-limit, text=str(-limit), showarrow=False, xref="paper", yref="y2", font=dict(color=LOSS_RED, size=12, family="JetBrains Mono"), xanchor="right", xshift=-5)
+
+    position_range = [-(limit + 20), limit + 20] if show_negative_limit else [0, limit + 20]
 
     fig.update_layout(
         title=dict(text="MACRO VIEW — PNL vs. INVENTORY LOCK", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
@@ -821,7 +1181,7 @@ def plot_pnl_inventory(df, selected_product):
         font=dict(color="#ffffff", family="JetBrains Mono"),
         xaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title="", range=[0, df['timestamp'].max()], tickfont=dict(size=9, color="#ffffff"), linecolor=GRID_COLOR),
         yaxis=dict(showgrid=True, gridcolor=GRID_COLOR, title=dict(text="PnL (Xirecs)", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff")),
-        yaxis2=dict(showgrid=False, title=dict(text="Net Position (Lots)", font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff"), range=[-(limit+20), limit+20]),
+        yaxis2=dict(showgrid=False, title=dict(text=inventory_label, font=dict(color="#ffffff")), tickfont=dict(size=9, color="#ffffff"), range=position_range),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#ffffff", size=9, family="JetBrains Mono")),
         margin=dict(l=0, r=40, t=15, b=0),
         hovermode="x",
@@ -913,10 +1273,35 @@ def plot_toxicity_markout(m_trades, markout_horizon):
     return fig
 
 def plot_spread_capture(our_trades, df_mkt):
-    if our_trades.empty: return go.Figure()
-    
-    trades_with_mid = pd.merge_asof(our_trades.sort_values('timestamp'), df_mkt[['timestamp', 'mid_price']].sort_values('timestamp'), on='timestamp')
-    trades_with_mid['quoted_edge'] = np.where(trades_with_mid['is_our_buy'], trades_with_mid['mid_price'] - trades_with_mid['price'], trades_with_mid['price'] - trades_with_mid['mid_price'])
+    if our_trades.empty:
+        return go.Figure()
+
+    trades_with_mid = our_trades.sort_values('timestamp').copy()
+
+    if not df_mkt.empty and {'timestamp', 'mid_price'}.issubset(df_mkt.columns):
+        market_mid = (
+            df_mkt[['timestamp', 'mid_price']]
+            .dropna(subset=['timestamp'])
+            .sort_values('timestamp')
+            .rename(columns={'mid_price': 'book_mid'})
+        )
+        if not market_mid.empty:
+            trades_with_mid = pd.merge_asof(trades_with_mid, market_mid, on='timestamp', direction='backward')
+
+    if 'book_mid' not in trades_with_mid.columns:
+        trades_with_mid['book_mid'] = np.nan
+    if 'mid_price' in trades_with_mid.columns:
+        trades_with_mid['book_mid'] = trades_with_mid['book_mid'].fillna(trades_with_mid['mid_price'])
+
+    trades_with_mid = trades_with_mid.dropna(subset=['book_mid', 'price'])
+    if trades_with_mid.empty:
+        return go.Figure()
+
+    trades_with_mid['quoted_edge'] = np.where(
+        trades_with_mid['is_our_buy'],
+        trades_with_mid['book_mid'] - trades_with_mid['price'],
+        trades_with_mid['price'] - trades_with_mid['book_mid'],
+    )
     
     fig = go.Figure()
     
@@ -1273,6 +1658,327 @@ def plot_telemetry_brainwaves(df_mkt, df_trd, df_tel, selected_signals):
     )
     return fig
 
+def plot_options_risk_timeline(risk_df):
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=risk_df['timestamp'], y=risk_df['combined_pnl'], name="Combined PnL",
+        line=dict(color=IMC_BLUE, width=2)
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=risk_df['timestamp'], y=risk_df['voucher_pnl'], name="Voucher PnL",
+        line=dict(color=PROFIT_GREEN, width=1.5, dash="dot")
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=risk_df['timestamp'], y=risk_df['portfolio_delta'], name="Portfolio Delta",
+        line=dict(color=LOSS_RED, width=1.5)
+    ), secondary_y=True)
+    fig.add_trace(go.Scatter(
+        x=risk_df['timestamp'], y=risk_df['portfolio_vega_1pct'], name="Vega / 1 vol pt",
+        line=dict(color='#a855f7', width=1.2)
+    ), secondary_y=True)
+    fig.add_trace(go.Scatter(
+        x=risk_df['timestamp'], y=risk_df['portfolio_gamma'], name="Gamma",
+        line=dict(color='#06d6a0', width=1.2, dash="dot")
+    ), secondary_y=True)
+    fig.add_trace(go.Scatter(
+        x=risk_df['timestamp'], y=risk_df['underlying_position'], name="Underlying Pos",
+        line=dict(color='#f59e0b', width=1, dash="dash")
+    ), secondary_y=True)
+
+    for level in [-50, -30, -20, 20, 30, 50]:
+        fig.add_hline(y=level, line=dict(color="rgba(255,255,255,0.18)", width=1, dash="dash"), secondary_y=True)
+
+    fig.update_layout(
+        title=dict(text="OPTIONS RISK TIMELINE — PNL VS DELTA / VEGA", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
+        font=dict(color=TEXT_COLOR, family="JetBrains Mono", size=10),
+        height=440,
+        margin=dict(l=0, r=40, t=42, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_yaxes(title_text="PnL (Xirecs)", secondary_y=False, gridcolor=GRID_COLOR)
+    fig.update_yaxes(title_text="Greeks / Position", secondary_y=True, gridcolor=GRID_COLOR)
+    return fig
+
+def plot_options_inventory_heatmap(product_frames, option_products):
+    if not option_products:
+        return go.Figure()
+    timestamps = product_frames[option_products[0]]['timestamp'].values
+    matrix = []
+    for product in option_products:
+        frame = product_frames[product].set_index('timestamp').reindex(timestamps).ffill().fillna(0)
+        limit = LIMITS.get(product, 300)
+        matrix.append((frame['exact_position'].values / limit) * 100.0)
+    fig = go.Figure(data=go.Heatmap(
+        z=matrix, x=timestamps, y=option_products,
+        colorscale=[[0, LOSS_RED], [0.5, BG_COLOR], [1, PROFIT_GREEN]],
+        zmid=0,
+        colorbar=dict(title="% Limit")
+    ))
+    fig.update_layout(
+        title=dict(text="VOUCHER INVENTORY HEATMAP — POSITION AS % OF LIMIT", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
+        font=dict(color=TEXT_COLOR, family="JetBrains Mono", size=10),
+        height=330,
+        margin=dict(l=0, r=20, t=42, b=0)
+    )
+    return fig
+
+def build_option_detail_frame(product_frames, option_product):
+    if option_product not in product_frames or UNDERLYING_PRODUCT not in product_frames:
+        return pd.DataFrame()
+    opt = product_frames[option_product].copy().sort_values('timestamp')
+    under = product_frames[UNDERLYING_PRODUCT][['timestamp', 'mid_price', 'exact_position', 'profit_and_loss']].copy()
+    under = under.rename(columns={
+        'mid_price': 'spot',
+        'exact_position': 'underlying_position',
+        'profit_and_loss': 'underlying_pnl',
+    }).sort_values('timestamp')
+    detail = pd.merge(opt, under, on='timestamp', how='left').ffill()
+    strike = strike_from_option(option_product)
+    tte = np.maximum((detail['timestamp'].astype(float) / -1_000_000.0 + ROUND3_TTE_DAYS) / DAYS_PER_YEAR, 0.25 / DAYS_PER_YEAR).values
+    iv = np.array([implied_vol_scalar(price, spot, strike, t) for price, spot, t in zip(detail['mid_price'], detail['spot'], tte)])
+    iv = pd.Series(iv).ffill().fillna(0.0001).values
+    delta, gamma, vega = bs_greeks_vector(detail['spot'].values, strike, tte, iv)
+    position = detail['exact_position'].astype(float).values
+    detail['iv'] = iv
+    detail['delta_contrib'] = position * delta
+    detail['gamma_contrib'] = position * gamma
+    detail['vega_1pct'] = position * vega * 0.01
+    return detail
+
+def telemetry_for_option(df_telemetry, option_product):
+    if df_telemetry.empty or 'target_product' not in df_telemetry.columns:
+        return pd.DataFrame()
+    tel = df_telemetry[df_telemetry['target_product'] == option_product].copy()
+    if tel.empty:
+        return tel
+    for col in tel.columns:
+        if col not in ['timestamp', 'tag', 'target_product']:
+            tel[col] = pd.to_numeric(tel[col], errors='coerce')
+    return tel
+
+def plot_option_strike_detail(option_product, detail, trades, telemetry):
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": True}]],
+        vertical_spacing=0.06,
+        row_heights=[0.42, 0.32, 0.26],
+    )
+
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['ask_price_1'], name="Ask",
+        line=dict(color="rgba(248,81,73,0.45)", width=1), hovertemplate="Ask %{y}<extra></extra>"
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['bid_price_1'], name="Bid",
+        line=dict(color="rgba(63,185,80,0.45)", width=1), fill='tonexty',
+        fillcolor="rgba(88,166,255,0.08)", hovertemplate="Bid %{y}<extra></extra>"
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['mid_price'], name="Mid",
+        line=dict(color=IMC_BLUE, width=2), hovertemplate="Mid %{y}<extra></extra>"
+    ), row=1, col=1)
+
+    if not trades.empty:
+        our = trades[(trades['product'] == option_product) & (trades['is_our_buy'] | trades['is_our_sell'])].copy()
+        buys = our[our['is_our_buy']]
+        sells = our[our['is_our_sell']]
+        if not buys.empty:
+            fig.add_trace(go.Scatter(
+                x=buys['timestamp'], y=buys['price'], name="Our Buys",
+                mode="markers", marker=dict(color=PROFIT_GREEN, size=9, symbol="triangle-up", line=dict(color="#ffffff", width=1)),
+                customdata=buys['quantity'],
+                hovertemplate="BUY %{customdata} @ %{y}<extra></extra>"
+            ), row=1, col=1)
+        if not sells.empty:
+            fig.add_trace(go.Scatter(
+                x=sells['timestamp'], y=sells['price'], name="Our Sells",
+                mode="markers", marker=dict(color=LOSS_RED, size=9, symbol="triangle-down", line=dict(color="#ffffff", width=1)),
+                customdata=sells['quantity'],
+                hovertemplate="SELL %{customdata} @ %{y}<extra></extra>"
+            ), row=1, col=1)
+
+    fair_col = None
+    for col in ['fair', 'FAIR']:
+        if col in telemetry.columns:
+            fair_col = col
+            break
+    if fair_col is not None and not telemetry.empty:
+        fair = telemetry[['timestamp', fair_col]].dropna().groupby('timestamp', as_index=False).last()
+        fig.add_trace(go.Scatter(
+            x=fair['timestamp'], y=fair[fair_col], name="Logged Fair",
+            line=dict(color="#f59e0b", width=1.5, dash="dot"),
+            hovertemplate="Fair %{y:.2f}<extra></extra>"
+        ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['profit_and_loss'], name="PnL",
+        line=dict(color=IMC_BLUE, width=2), hovertemplate="PnL %{y:,.0f}<extra></extra>"
+    ), row=2, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['exact_position'], name="Position",
+        fill='tozeroy', line=dict(color="#8899aa", width=1, shape="hv"), fillcolor="rgba(136,153,170,0.15)",
+        hovertemplate="Pos %{y}<extra></extra>"
+    ), row=2, col=1, secondary_y=True)
+    limit = LIMITS.get(option_product, 300)
+    fig.add_hline(y=limit, line=dict(color="rgba(248,81,73,0.5)", width=1, dash="dash"), row=2, col=1, secondary_y=True)
+    fig.add_hline(y=-limit, line=dict(color="rgba(248,81,73,0.5)", width=1, dash="dash"), row=2, col=1, secondary_y=True)
+
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['delta_contrib'], name="Delta",
+        line=dict(color=LOSS_RED, width=1.5), hovertemplate="Delta %{y:.2f}<extra></extra>"
+    ), row=3, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['vega_1pct'], name="Vega / 1 vol pt",
+        line=dict(color="#a855f7", width=1.2), hovertemplate="Vega1% %{y:.2f}<extra></extra>"
+    ), row=3, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=detail['timestamp'], y=detail['gamma_contrib'], name="Gamma",
+        line=dict(color="#06d6a0", width=1.2, dash="dot"), hovertemplate="Gamma %{y:.4f}<extra></extra>"
+    ), row=3, col=1, secondary_y=True)
+
+    for sig_col, color in [('z', '#f59e0b'), ('edge', '#ffffff')]:
+        if sig_col in telemetry.columns and not telemetry.empty:
+            sig = telemetry[['timestamp', sig_col]].dropna().groupby('timestamp', as_index=False).last()
+            if not sig.empty:
+                fig.add_trace(go.Scatter(
+                    x=sig['timestamp'], y=sig[sig_col], name=sig_col.upper(),
+                    line=dict(color=color, width=1, dash="dash"),
+                    hovertemplate=f"{sig_col.upper()} " + "%{y:.2f}<extra></extra>"
+                ), row=3, col=1, secondary_y=True)
+
+    fig.update_layout(
+        title=dict(text=f"{option_product} — STRIKE DETAIL", font=dict(color="#ffffff", size=11, family="JetBrains Mono"), x=0),
+        plot_bgcolor=BG_COLOR, paper_bgcolor=PANEL_BG,
+        font=dict(color=TEXT_COLOR, family="JetBrains Mono", size=10),
+        height=760,
+        margin=dict(l=0, r=50, t=42, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1)
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1, gridcolor=GRID_COLOR)
+    fig.update_yaxes(title_text="PnL", row=2, col=1, secondary_y=False, gridcolor=GRID_COLOR)
+    fig.update_yaxes(title_text="Position", row=2, col=1, secondary_y=True, gridcolor=GRID_COLOR)
+    fig.update_yaxes(title_text="Delta / Vega", row=3, col=1, secondary_y=False, gridcolor=GRID_COLOR)
+    fig.update_yaxes(title_text="Gamma / Signal", row=3, col=1, secondary_y=True, gridcolor=GRID_COLOR)
+    return fig
+
+def render_options_risk_page(df_market, df_trades, product_frames, selected_assets):
+    option_products = [p for p in OPTION_PRODUCTS if p in selected_assets and p in product_frames]
+    risk_df, option_products = build_options_risk_frame(product_frames, selected_assets)
+    if risk_df.empty:
+        st.warning("Options Risk needs VELVETFRUIT_EXTRACT and at least one VEV_* voucher selected.")
+        return
+
+    window, dd_rows = options_drawdown_attribution(risk_df, product_frames, option_products)
+    final_combined = float(risk_df['combined_pnl'].iloc[-1])
+    final_voucher = float(risk_df['voucher_pnl'].iloc[-1])
+    final_underlying = float(risk_df['underlying_pnl'].iloc[-1])
+    max_dd = window['drawdown'] if window else 0.0
+    avg_abs_delta = float(risk_df['portfolio_delta'].abs().mean())
+    max_abs_delta = float(risk_df['portfolio_delta'].abs().max())
+    avg_abs_vega = float(risk_df['portfolio_vega_1pct'].abs().mean())
+    max_abs_vega = float(risk_df['portfolio_vega_1pct'].abs().max())
+    avg_abs_gamma = float(risk_df['portfolio_gamma'].abs().mean())
+    max_abs_gamma = float(risk_df['portfolio_gamma'].abs().max())
+    max_gross = float(risk_df['gross_voucher_position'].max())
+
+    st.markdown('<div class="section-label">OPTIONS RISK / VOUCHER BOOK</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+        <div class="metric-grid-5">
+            {metric_card("COMBINED PNL", f"{final_combined:,.0f} $", "vouchers + underlying", "pos" if final_combined >= 0 else "neg", "cyan")}
+            {metric_card("VOUCHER PNL", f"{final_voucher:,.0f} $", "options only", "pos" if final_voucher >= 0 else "neg", "")}
+            {metric_card("UNDERLYING PNL", f"{final_underlying:,.0f} $", "hedge / delta-1", "pos" if final_underlying >= 0 else "neg", "amber")}
+            {metric_card("MAX DRAWDOWN", f"{max_dd:,.0f} $", "combined curve", "neg" if max_dd > 0 else "", "red")}
+            {metric_card("MAX GROSS VOUCHERS", f"{max_gross:,.0f}", "sum abs voucher pos", "amber" if max_gross > 600 else "", "purple")}
+        </div>
+        <div class="metric-grid-4">
+            {metric_card("AVG |DELTA|", f"{avg_abs_delta:,.1f}", "portfolio", "amber" if avg_abs_delta > 20 else "pos", "")}
+            {metric_card("MAX |DELTA|", f"{max_abs_delta:,.1f}", "portfolio", "neg" if max_abs_delta > 50 else ("amber" if max_abs_delta > 30 else "pos"), "red")}
+            {metric_card("AVG |VEGA|", f"{avg_abs_vega:,.1f}", "per 1 vol point", "", "")}
+            {metric_card("MAX |VEGA|", f"{max_abs_vega:,.1f}", "per 1 vol point", "amber" if max_abs_vega > 300 else "", "purple")}
+        </div>
+        <div class="metric-grid-3">
+            {metric_card("AVG |GAMMA|", f"{avg_abs_gamma:,.3f}", "portfolio", "", "cyan")}
+            {metric_card("MAX |GAMMA|", f"{max_abs_gamma:,.3f}", "portfolio", "amber" if max_abs_gamma > 2 else "", "cyan")}
+            {metric_card("VOUCHERS TRACKED", f"{len(option_products)}", "selected VEV products", "", "")}
+        </div>
+    """, unsafe_allow_html=True)
+
+    st.plotly_chart(plot_options_risk_timeline(risk_df), width='stretch', key="options_risk_timeline")
+
+    if window:
+        st.markdown('<div class="section-label">DRAWDOWN ATTRIBUTION</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+            <div class="metric-grid-5">
+                {metric_card("DD WINDOW", f"{window['peak_ts']} -> {window['trough_ts']}", "peak to trough", "", "")}
+                {metric_card("SPOT MOVE", f"{window['spot_move']:,.1f}", "underlying points", "amber" if abs(window['spot_move']) > 5 else "", "amber")}
+                {metric_card("START DELTA", f"{window['start_delta']:,.1f}", "portfolio delta at peak", "neg" if abs(window['start_delta']) > 40 else "amber", "red")}
+                {metric_card("DELTA EST PNL", f"{window['delta_estimate']:,.0f} $", "start delta x spot move", "neg" if window['delta_estimate'] < 0 else "pos", "")}
+                {metric_card("UNEXPLAINED", f"{window['unexplained']:,.0f} $", "actual minus delta estimate", "neg" if window['unexplained'] < 0 else "pos", "purple")}
+            </div>
+        """, unsafe_allow_html=True)
+        dd_show = dd_rows.rename(columns={
+            'product': 'Product',
+            'pnl_change': 'PnL Chg',
+            'start_pos': 'Start Pos',
+            'end_pos': 'End Pos',
+            'start_pnl': 'Start PnL',
+            'end_pnl': 'End PnL',
+        })
+        st.dataframe(
+            dd_show.style.format({'PnL Chg': '{:,.0f}', 'Start PnL': '{:,.0f}', 'End PnL': '{:,.0f}', 'Start Pos': '{:,.0f}', 'End Pos': '{:,.0f}'}),
+            width='stretch',
+            height=260,
+        )
+
+    st.markdown('<div class="section-label">PER-VOUCHER RISK MATRIX</div>', unsafe_allow_html=True)
+    summary = option_product_summary(product_frames, df_trades, option_products, dd_rows)
+    if not summary.empty:
+        st.dataframe(
+            summary.style.format({
+                'Final PnL': '{:,.0f}', 'DD Chg': '{:,.0f}', 'Avg Abs Pos': '{:,.1f}',
+                'Time >50% Lim': '{:,.1f}%', 'Avg Buy': '{:,.2f}', 'Avg Sell': '{:,.2f}'
+            }),
+            width='stretch',
+            height=330,
+        )
+
+    st.plotly_chart(plot_options_inventory_heatmap(product_frames, option_products), width='stretch', key="options_inventory_heatmap")
+
+    st.markdown('<div class="section-label">PER-STRIKE DIAGNOSTIC</div>', unsafe_allow_html=True)
+    default_idx = option_products.index('VEV_5200') if 'VEV_5200' in option_products else 0
+    focus_option = st.selectbox(
+        "FOCUS VOUCHER",
+        option_products,
+        index=default_idx,
+        help="Inspect one strike at a time: market/fills, PnL/position, Greeks, and logged signal overlays.",
+    )
+    detail = build_option_detail_frame(product_frames, focus_option)
+    tel = telemetry_for_option(df_telemetry, focus_option)
+    if detail.empty:
+        st.info("No detail data available for selected voucher.")
+    else:
+        st.plotly_chart(
+            plot_option_strike_detail(focus_option, detail, df_trades, tel),
+            width='stretch',
+            key=f"option_detail_{focus_option}",
+        )
+
+    st.markdown('<div class="section-label">FILL QUALITY / MARKOUTS</div>', unsafe_allow_html=True)
+    quality = fill_quality_table(df_trades, product_frames, option_products)
+    if quality.empty:
+        st.info("No own voucher fills found.")
+    else:
+        markout_cols = [c for c in quality.columns if c.startswith('T+')]
+        fmt = {col: '{:,.2f}' for col in markout_cols}
+        fmt['Qty'] = '{:,.0f}'
+        st.dataframe(quality.style.format(fmt), width='stretch', height=360)
+
 # --- HELPER: render a metric card ---
 def metric_card(label, value, sub=None, color_class="", wrapper_class=""):
     sub_html = f'<div class="metric-sub">{sub}</div>' if sub else ""
@@ -1314,6 +2020,14 @@ st.sidebar.markdown("""
 
 uploaded_file = st.sidebar.file_uploader("DROP LOG FILE (.log)", type=['log'])
 selected_product = None
+selected_assets = []
+metric_scope = "SELECTED ASSETS"
+page_mode = st.sidebar.radio(
+    "PAGE",
+    ["EXECUTION DASHBOARD", "OPTIONS RISK"],
+    index=0,
+    help="OPTIONS RISK is a dedicated voucher-book page for PnL, Greeks, drawdowns, fills, and inventory.",
+)
 
 if uploaded_file:
     df_market, df_trades, df_telemetry, error = process_log_file(uploaded_file)
@@ -1321,9 +2035,42 @@ if uploaded_file:
         st.error(error)
         st.stop()
     st.sidebar.success("✓ LOG PARSED SUCCESSFULLY")
-    product_options = df_market['product'].unique()
+    product_options = list(df_market['product'].dropna().unique())
     if len(product_options) > 0:
-        selected_product = st.sidebar.selectbox("SELECT ASSET", product_options)
+        product_signature = tuple(product_options)
+        if st.session_state.get("asset_filter_signature") != product_signature:
+            st.session_state["asset_filter_signature"] = product_signature
+            st.session_state["selected_assets"] = product_options.copy()
+
+        asset_btn_col1, asset_btn_col2 = st.sidebar.columns(2)
+        if asset_btn_col1.button("SELECT ALL", use_container_width=True):
+            st.session_state["selected_assets"] = product_options.copy()
+        if asset_btn_col2.button("CLEAR", use_container_width=True):
+            st.session_state["selected_assets"] = []
+
+        selected_assets = st.sidebar.multiselect(
+            "SELECT ASSETS",
+            product_options,
+            key="selected_assets",
+            help="Use SELECT ALL for full-round logs, then remove any product tag such as HYDROGEL_PACK with one click.",
+        )
+
+        if selected_assets:
+            selected_product = st.sidebar.selectbox("FOCUS ASSET", selected_assets)
+            if len(selected_assets) > 1:
+                metric_scope = st.sidebar.radio(
+                    "METRIC SCOPE",
+                    ["SELECTED ASSETS", "FOCUS ASSET"],
+                    index=0,
+                    help="Top metrics and the macro chart use this scope. Product-specific forensic panels still use the focus asset.",
+                )
+            df_market = df_market[df_market['product'].isin(selected_assets)].copy()
+            if not df_trades.empty and 'product' in df_trades.columns:
+                df_trades = df_trades[df_trades['product'].isin(selected_assets)].copy()
+            if not df_telemetry.empty and 'target_product' in df_telemetry.columns:
+                df_telemetry = df_telemetry[df_telemetry['target_product'].isin(selected_assets)].copy()
+        else:
+            st.sidebar.warning("Select at least one asset to render the dashboard.")
 
 st.sidebar.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
 st.sidebar.markdown("""
@@ -1359,20 +2106,31 @@ vwap_window = st.sidebar.slider(
 if selected_product:
     product_frames = build_product_frames(df_market, df_trades, df_telemetry)
 
-    df_mkt_prod = product_frames[selected_product].copy()
-    if not df_trades.empty:
-        df_trd_prod = df_trades[df_trades['product'] == selected_product].copy()
-        df_mkt_l1 = df_mkt_prod[['timestamp', 'bid_price_1', 'ask_price_1']].copy().dropna()
-        df_trd_prod = pd.merge_asof(df_trd_prod.sort_values('timestamp'), df_mkt_l1.sort_values('timestamp'), on='timestamp', direction='backward')
-        df_trd_prod['is_taker'] = False
-        df_trd_prod.loc[df_trd_prod['is_our_buy']  & (df_trd_prod['price'] >= df_trd_prod['ask_price_1']), 'is_taker'] = True
-        df_trd_prod.loc[df_trd_prod['is_our_sell'] & (df_trd_prod['price'] <= df_trd_prod['bid_price_1']), 'is_taker'] = True
+    if page_mode == "OPTIONS RISK":
+        render_options_risk_page(df_market, df_trades, product_frames, selected_assets)
+        st.stop()
+
+    df_mkt_focus = product_frames[selected_product].copy()
+    df_trd_focus = attach_book_context_to_trades(df_trades, product_frames, [selected_product])
+
+    scope_products = selected_assets if metric_scope == "SELECTED ASSETS" else [selected_product]
+    scope_is_portfolio = metric_scope == "SELECTED ASSETS" and len(scope_products) > 1
+    scope_label = "SELECTED_ASSETS" if scope_is_portfolio else selected_product
+    if scope_is_portfolio:
+        df_mkt_prod = build_portfolio_frame({product: product_frames[product] for product in scope_products if product in product_frames})
+        df_trd_prod = attach_book_context_to_trades(df_trades, product_frames, scope_products)
+        inventory_label = "Total |Position| (Lots)"
+        show_negative_limit = False
+        limit = combined_limit(scope_products)
     else:
-        df_trd_prod = pd.DataFrame()
+        df_mkt_prod = df_mkt_focus.copy()
+        df_trd_prod = df_trd_focus.copy()
+        inventory_label = "Net Position (Lots)"
+        show_negative_limit = True
+        limit = LIMITS.get(selected_product, 80)
     
     # --- METRIC CALCULATIONS ---
     final_pnl = df_mkt_prod['profit_and_loss'].iloc[-1]
-    last_mid = df_mkt_prod['mid_price'].iloc[-1]
     pnl_series = df_mkt_prod['profit_and_loss']
     pnl_diff = pnl_series.diff().fillna(0)
     max_drawdown = abs((pnl_series - pnl_series.cummax()).min())
@@ -1382,10 +2140,10 @@ if selected_product:
     if not df_trd_prod.empty:
         our_trades = df_trd_prod[df_trd_prod['is_our_buy'] | df_trd_prod['is_our_sell']].copy()
         if not our_trades.empty:
-            # Value each trade against the end-of-log mid price
+            # Value each trade against its own product's end-of-log mid price.
             our_trades['trade_pnl'] = np.where(our_trades['is_our_buy'], 
-                                               (last_mid - our_trades['price']) * our_trades['quantity'],
-                                               (our_trades['price'] - last_mid) * our_trades['quantity'])
+                                               (our_trades['final_mid'] - our_trades['price']) * our_trades['quantity'],
+                                               (our_trades['price'] - our_trades['final_mid']) * our_trades['quantity'])
             maker_pnl = our_trades[~our_trades['is_taker']]['trade_pnl'].sum()
             taker_pnl = our_trades[our_trades['is_taker']]['trade_pnl'].sum()
             gross_p = our_trades[our_trades['trade_pnl'] > 0]['trade_pnl'].sum()
@@ -1408,7 +2166,6 @@ if selected_product:
             spread_capture = (our_trades['captured'].sum() / our_trades['half_spread'].sum() * 100) if our_trades['half_spread'].sum() > 0 else 0
         else: spread_capture = 0
     else: spread_capture = 0
-    limit = LIMITS.get(selected_product, 80)
     abs_position = df_mkt_prod['exact_position'].abs()
     time_locked = np.mean(abs_position.values >= limit) * 100
     near_50 = np.mean(abs_position.values >= 0.50 * limit) * 100
@@ -1416,7 +2173,7 @@ if selected_product:
     near_90 = np.mean(abs_position.values >= 0.90 * limit) * 100
     max_abs_position = abs_position.max()
     avg_abs_position = abs_position.mean()
-    skew_bias = df_mkt_prod['exact_position'].mean()
+    skew_bias = df_mkt_prod['net_position'].mean() if 'net_position' in df_mkt_prod.columns else df_mkt_prod['exact_position'].mean()
     pnl_per_max_dd = final_pnl / max_drawdown if max_drawdown > 0 else np.nan
     pnl_per_avg_abs_position = final_pnl / avg_abs_position if avg_abs_position > 0 else np.nan
     selected_buckets = pnl_buckets(df_mkt_prod)
@@ -1428,14 +2185,8 @@ if selected_product:
     if not df_trd_prod.empty:
         our_trades = df_trd_prod[df_trd_prod['is_our_buy'] | df_trd_prod['is_our_sell']].copy()
         if not our_trades.empty:
-            df_mkt_future = df_mkt_prod[['timestamp', 'mid_price']].copy()
-            # Corrected: Look into the FUTURE (T+horizon)
-            df_mkt_future['timestamp'] = df_mkt_future['timestamp'] - (markout_horizon * 100)
-            df_mkt_future = df_mkt_future.rename(columns={'mid_price': 'future_mid'})
-            m_trades = pd.merge(our_trades, df_mkt_future, on='timestamp', how='inner')
+            m_trades = build_markout_trades(our_trades, product_frames, markout_horizon)
             if not m_trades.empty:
-                m_trades['m_edge'] = np.where(m_trades['is_our_buy'], m_trades['future_mid'] - m_trades['price'], m_trades['price'] - m_trades['future_mid'])
-                
                 # Volume-Weighted Metrics
                 total_m_vol = m_trades['quantity'].sum()
                 if total_m_vol > 0:
@@ -1528,33 +2279,48 @@ if selected_product:
     """, unsafe_allow_html=True)
 
     # ---- MACRO CHARTS ----
+    scope_key_prefix = scope_label.replace(" ", "_").replace("/", "_")
     chart_key_prefix = selected_product.replace(" ", "_").replace("/", "_")
-    st.plotly_chart(plot_pnl_inventory(df_mkt_prod, selected_product), width='stretch', key=f"{chart_key_prefix}_pnl_inventory")
-    st.plotly_chart(plot_microstructure_xray(df_mkt_prod, df_trd_prod), width='stretch', key=f"{chart_key_prefix}_microstructure_xray")
+    st.plotly_chart(
+        plot_pnl_inventory(
+            df_mkt_prod,
+            scope_label,
+            limit_override=limit,
+            inventory_label=inventory_label,
+            show_negative_limit=show_negative_limit,
+        ),
+        width='stretch',
+        key=f"{scope_key_prefix}_pnl_inventory",
+    )
+
+    focus_our_trades = df_trd_focus[df_trd_focus['is_our_buy'] | df_trd_focus['is_our_sell']].copy() if not df_trd_focus.empty else pd.DataFrame()
+    m_trades_focus = build_markout_trades(focus_our_trades, product_frames, markout_horizon)
+
+    st.plotly_chart(plot_microstructure_xray(df_mkt_focus, df_trd_focus), width='stretch', key=f"{chart_key_prefix}_microstructure_xray")
     
     st.markdown("---")
     st.markdown('<div class="section-label">🤖&nbsp;&nbsp;BOT BEHAVIOR & FLOW DYNAMICS</div>', unsafe_allow_html=True)
     
     c5, c6 = st.columns(2)
-    with c5: st.plotly_chart(plot_magic_size_fingerprinter(df_mkt_prod, df_trd_prod, markout_horizon), width='stretch', key=f"{chart_key_prefix}_magic_size")
-    with c6: st.plotly_chart(plot_liquidation_radar(df_mkt_prod, df_trd_prod), width='stretch', key=f"{chart_key_prefix}_liquidation_radar")
+    with c5: st.plotly_chart(plot_magic_size_fingerprinter(df_mkt_focus, df_trd_focus, markout_horizon), width='stretch', key=f"{chart_key_prefix}_magic_size")
+    with c6: st.plotly_chart(plot_liquidation_radar(df_mkt_focus, df_trd_focus), width='stretch', key=f"{chart_key_prefix}_liquidation_radar")
     
     st.markdown("---")
     st.markdown('<div class="section-label">🎯&nbsp;&nbsp;MOMENTUM & WALL ANALYTICS</div>', unsafe_allow_html=True)
     
-    st.plotly_chart(plot_true_mid_divergence(df_mkt_prod), width='stretch', key=f"{chart_key_prefix}_true_mid_divergence")
-    st.plotly_chart(plot_vwap_momentum(df_mkt_prod, df_trd_prod, vwap_window), width='stretch', key=f"{chart_key_prefix}_vwap_momentum")
+    st.plotly_chart(plot_true_mid_divergence(df_mkt_focus), width='stretch', key=f"{chart_key_prefix}_true_mid_divergence")
+    st.plotly_chart(plot_vwap_momentum(df_mkt_focus, df_trd_focus, vwap_window), width='stretch', key=f"{chart_key_prefix}_vwap_momentum")
     
     st.markdown("---")
     st.markdown('<div class="section-label">🔬&nbsp;&nbsp;EXECUTION & FLOW ANALYSIS</div>', unsafe_allow_html=True)
     
     c1, c2 = st.columns(2)
-    with c1: st.plotly_chart(plot_toxicity_markout(m_trades, markout_horizon), width='stretch', key=f"{chart_key_prefix}_toxicity_markout")
-    with c2: st.plotly_chart(plot_spread_capture(m_trades, df_mkt_prod), width='stretch', key=f"{chart_key_prefix}_spread_capture")
+    with c1: st.plotly_chart(plot_toxicity_markout(m_trades_focus, markout_horizon), width='stretch', key=f"{chart_key_prefix}_toxicity_markout")
+    with c2: st.plotly_chart(plot_spread_capture(m_trades_focus, df_mkt_focus), width='stretch', key=f"{chart_key_prefix}_spread_capture")
 
     c3, c4 = st.columns(2)
-    with c3: st.plotly_chart(plot_imbalance_matrix(m_trades, df_mkt_prod, imbalance_level), width='stretch', key=f"{chart_key_prefix}_imbalance_matrix")
-    with c4: st.plotly_chart(plot_whale_profiler(df_trd_prod), width='stretch', key=f"{chart_key_prefix}_whale_profiler")
+    with c3: st.plotly_chart(plot_imbalance_matrix(m_trades_focus, df_mkt_focus, imbalance_level), width='stretch', key=f"{chart_key_prefix}_imbalance_matrix")
+    with c4: st.plotly_chart(plot_whale_profiler(df_trd_focus), width='stretch', key=f"{chart_key_prefix}_whale_profiler")
 
     st.markdown("---")
     st.markdown('<div class="section-label">🧠&nbsp;&nbsp;TELEMETRY & SIGNAL DIAGNOSTICS</div>', unsafe_allow_html=True)
@@ -1586,7 +2352,7 @@ if selected_product:
     # Render plot into the container
     with telemetry_plot_container:
         st.plotly_chart(
-            plot_telemetry_brainwaves(df_mkt_prod, df_trd_prod, df_tel_prod, selected_signals),
+            plot_telemetry_brainwaves(df_mkt_focus, df_trd_focus, df_tel_prod, selected_signals),
             width='stretch',
             key=f"{chart_key_prefix}_telemetry_brainwaves",
         )
